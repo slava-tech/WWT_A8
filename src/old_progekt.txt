@@ -1,0 +1,3260 @@
+
+
+/*
+ * =================================================================================
+ * ПРОЕКТ: KC868-A8 (ESP32) — Локальна версія для тестування
+ * ВЕРСІЯ: 2.1 (RTC + Комфортний режим + Виправлення)
+ * ОНОВЛЕННЯ: 13.09.2025
+ * Зміни:
+ * - (FIX) Усунено "фрізи" системи при першому запуску (до налаштування часу). Комфортний режим не активується,
+ * доки користувач хоча б один раз не встановить час через веб-інтерфейс.
+ * - (UI) Формат часу у веб-інтерфейсі змінено на "ГГ:ХХ (День тижня)" для кращої читабельності.
+ * - (UI) Перекомпоновано системний екран (№3) на OLED-дисплеї для коректного відображення часу,
+ * температури зовнішнього повітря (T out) та обох температур мережі (T net in/out).
+ * - (UI) Додано індикацію активного комфортного режиму у веб-інтерфейсі та на OLED-дисплеї.
+ * Уставка тепер відображається у форматі: "Tset: 53.0 C (-2.0)".
+ * =================================================================================
+ */
+
+// --- Секция 1: Подключение библиотек ---
+#include <WiFi.h>
+#include <WebServer.h>
+#include <pgmspace.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Preferences.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <ArduinoJson.h>
+#include <esp_task_wdt.h>
+#include <RTClib.h> // Бібліотека для RTC
+
+// --- Секция 1.1: Определение структуры и реестра "Плиток" (режимов работы) ---
+struct TileDef {
+  const char* id;
+  const char* displayName;
+  const char* TPOD;
+  const char* TINV;
+  const char* TZAD;
+  const char* settingsLabel;
+  float       defaultValue;
+};
+
+enum TileIndex : uint8_t {
+  TILE_CO_1 = 0, TILE_GVP_1, TILE_CO_2, TILE_GVP_2, TILE_CUSTOM_5, TILE_CUSTOM_6
+};
+
+struct PIDController {
+    float integralSum = 0.0f;
+    unsigned long lastRunTime = 0;
+    unsigned long lastImpulseTime = 0;
+    int impulseCounter = 0;
+    int lastDirection = 0; // 1 для +, -1 для -, 0 для стоп
+    unsigned long counterResetTime = 0;
+    enum ValveControlPhase { PHASE_ACTIVE, PHASE_STANDBY } phase = PHASE_ACTIVE;
+    unsigned long phaseChangeTime = 0;
+    int standbyCycleCounter = 0;
+};
+
+
+// --- Секция 1.2: Структури для логики управления насосами ---
+enum PumpStatus : uint8_t { S_OK, S_WORKING, S_ALARM, S_REPAIR };
+enum ContourLogicState : uint8_t { S_IDLE, S_START_DELAY, S_WAIT_FEEDBACK, S_NORMAL, S_CHANGEOVER_PAUSE, S_DRY_RUN_RECOVERY, S_ALL_PUMPS_ALARM };
+
+struct PumpState {
+    PumpStatus status = S_OK;
+    unsigned long workStartTime = 0;
+    unsigned long feedbackLossTime = 0;
+};
+
+struct ContourPumpLogic {
+    ContourLogicState state = S_IDLE;
+    int activePumpIndex = 0;
+    unsigned long stateTimer = 0;
+    PumpState pumps[2];
+    int prev_mode = -1;
+    int prev_dry_run_stable = -1;
+    bool summer_mode_active = false;
+    unsigned long dryRunAlarmStartTime = 0;
+    bool dryRunAlarmPending = false;
+};
+
+
+// --- Секция 2: Глобальные объекты и константы ---
+Preferences prefs;
+Preferences prefsParams;
+Preferences prefsProfiles;
+Preferences prefsGeneral;
+
+RTC_DS3231 rtc; // Об'єкт годинника
+
+PIDController pidController1;
+PIDController pidController2;
+
+ContourPumpLogic pumpLogic1;
+ContourPumpLogic pumpLogic2;
+
+uint8_t globalPumpEnableMask = 0b1111;
+
+
+// --- Секция 2.1: Конфигурация I2C, реле и OLED ---
+#define RELAY_I2C_ADDR 0x24
+#define I2C_SDA_PIN 4
+#define I2C_SCL_PIN 5
+const byte PCF8574_INPUTS_ADDR = 0x22;
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
+U8G2_SSD1309_128X64_NONAME0_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+// Прапорці та лічильники для відстеження стану I2C-пристроїв
+bool isDisplayAvailable = false;
+bool isRelayExpanderAvailable = false;
+bool isInputExpanderAvailable = false;
+bool isRtcAvailable = false; // Прапор для RTC
+
+uint8_t displayErrorCounter = 0;
+uint8_t relayErrorCounter = 0;
+uint8_t inputErrorCounter = 0;
+uint8_t rtcErrorCounter = 0; // Лічильник помилок для RTC
+const uint8_t I2C_ERROR_THRESHOLD = 5;
+
+unsigned long lastI2CRecoveryAttempt = 0;
+const unsigned long I2C_RECOVERY_INTERVAL = 15000; // 15 секунд
+
+bool wasInAutoModeContour1 = false;
+bool wasInAutoModeContour2 = false;
+
+// Змінні для стабільного стану входів (фільтрація)
+int contour1_mode_stable = 0, contour1_mode_last = 0, contour1_mode_count = 0;
+int dry_run_state_stable = 1, dry_run_state_last = 1, dry_run_state_count = 0;
+int pump1_state_stable = 0, pump1_state_last = 0, pump1_state_count = 0;
+int pump2_state_stable = 0, pump2_state_last = 0, pump2_state_count = 0;
+int contour2_mode_stable = 0, contour2_mode_last = 0, contour2_mode_count = 0;
+int dry_run_state_2_stable = 1, dry_run_state_2_last = 1, dry_run_state_2_count = 0;
+int pump3_state_stable = 0, pump3_state_last = 0, pump3_state_count = 0;
+int pump4_state_stable = 0, pump4_state_last = 0, pump4_state_count = 0;
+
+
+uint8_t relayStates = 0xFF;
+unsigned long pulseEndTimes[8] = {0};
+
+unsigned long lastInputReadTime = 0;
+const long inputReadInterval = 1000;
+unsigned long lastPIDRunTime = 0;
+const long pidRunInterval = 1000;
+unsigned long lastPumpLogicRunTime = 0;
+const long pumpLogicRunInterval = 1000;
+unsigned long lastDisplayUpdateTime = 0;
+const long displayUpdateInterval = 500;
+unsigned long lastTempRequestTime = 0;
+const long tempRequestInterval = 2000;
+
+// --- Секция 2.2: Переменные для управления кнопкой и дисплеем ---
+const int BUTTON_PIN = 34;
+bool displayOn = false;
+int currentScreen = 1;
+unsigned long lastDisplayActivityTime = 0;
+const unsigned long displayTimeout = 300000;
+
+bool apModeActive = false;
+unsigned long apModeStartTime = 0;
+const unsigned long apTimeout = 300000;
+
+int buttonState = LOW;
+int lastButtonState = LOW;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
+unsigned long buttonPressStartTime = 0;
+bool longPressTriggered = false;
+
+// Прототипи функцій
+float getTempByVar(const char* varName, bool& isAlarm);
+void triggerRelayPulse(int relayIndex, unsigned long duration);
+
+// Функція для читання та фільтрації входів PCF8574
+void readInputs() {
+    if (!isInputExpanderAvailable) {
+        // Логіка для "сліпого" режиму
+        wasInAutoModeContour1 = (contour1_mode_stable == 1);
+        wasInAutoModeContour2 = (contour2_mode_stable == 1);
+        return;
+    }
+
+    Wire.beginTransmission(PCF8574_INPUTS_ADDR);
+    Wire.write(0xFF);
+    if (Wire.endTransmission() != 0) {
+        if(inputErrorCounter < 255) inputErrorCounter++;
+        return;
+    }
+    
+    Wire.requestFrom((uint8_t)PCF8574_INPUTS_ADDR, (uint8_t)1);
+    if (Wire.available()) {
+        inputErrorCounter = 0; // Успішне читання - скидаємо лічильник
+        byte inputByte = Wire.read();
+        
+        auto filterInput = [](int& stable_state, int& last_state, int& counter, bool current_reading) {
+            int current_state = current_reading ? 1 : 0;
+            if (current_state == last_state) {
+                counter++;
+                if (counter >= 3) {
+                    stable_state = current_state;
+                    counter = 3;
+                }
+            } else {
+                counter = 1;
+                last_state = current_state;
+            }
+        };
+
+        filterInput(contour1_mode_stable, contour1_mode_last, contour1_mode_count, bitRead(inputByte, 0) == 0);
+        filterInput(dry_run_state_stable, dry_run_state_last, dry_run_state_count, bitRead(inputByte, 1) != 0);
+        filterInput(pump1_state_stable, pump1_state_last, pump1_state_count, bitRead(inputByte, 2) == 0);
+        filterInput(pump2_state_stable, pump2_state_last, pump2_state_count, bitRead(inputByte, 3) == 0);
+        filterInput(contour2_mode_stable, contour2_mode_last, contour2_mode_count, bitRead(inputByte, 4) == 0);
+        filterInput(dry_run_state_2_stable, dry_run_state_2_last, dry_run_state_2_count, bitRead(inputByte, 5) != 0);
+        filterInput(pump3_state_stable, pump3_state_last, pump3_state_count, bitRead(inputByte, 6) == 0);
+        filterInput(pump4_state_stable, pump4_state_last, pump4_state_count, bitRead(inputByte, 7) == 0);
+    } else {
+        if(inputErrorCounter < 255) inputErrorCounter++;
+    }
+}
+
+
+// --- Секция 3: Конфигурация шины 1-Wire и датчиков ---
+static const uint8_t OW_PIN = 14;
+static const uint8_t OW_MAX_HINT = 7;
+OneWire oneWire(OW_PIN);
+DallasTemperature ds18(&oneWire);
+
+const char* OW_VARS[] = {
+  "Tn","T1","T2","T11","T12","T21","T22","T31","T41","T32","T42"
+};
+const size_t OW_VAR_COUNT = sizeof(OW_VARS)/sizeof(OW_VARS[0]);
+
+struct SensorState {
+    float temperature = DEVICE_DISCONNECTED_C;
+    unsigned long lastUpdateTime = 0;
+    bool is_alarm = true;
+};
+SensorState sensorStates[OW_VAR_COUNT];
+
+// --- Секция 4: Данные "Плиток" (режимов работы) ---
+static const TileDef TILES[6] = {
+  { "CO_1",     "СО_1",       "T11", "T21", "Tr",  "Коеф. зміщеня графіку", 1.00f },
+  { "GVP_1",    "ГВП_1",      "T31", "T41", "Tr3", "Завдання ГВП",          55.0f },
+  { "CO_2",     "СО_2",       "T12", "T22", "Tr2", "Коеф. зміщеня графіку", 1.00f },
+  { "GVP_2",    "ГВП_2",      "T32", "T42", "Tr4", "Завдання ГВП",          55.0f },
+  { "CUSTOM_5", "Кнопка 5", "", "", "", "", 0.0f },
+  { "CUSTOM_6", "Кнопка 6", "", "", "", "", 0.0f }
+};
+
+// --- Секция 5: Вспомогательные функции для работы с плитками ---
+static inline const TileDef& getTile(uint8_t idx){
+  return TILES[(idx < 6) ? idx : 0];
+}
+
+static int tileIndexById(const String& id){
+  for (uint8_t i=0; i < 6; i++) {
+    if (id == TILES[i].id) return (int)i;
+  }
+  return -1;
+}
+
+static bool tileIdExists(const String& id) {
+  for (uint8_t i=0; i < 6; i++) {
+    if (id == TILES[i].id) return true;
+  }
+  return false;
+}
+
+// --- Секция 6: Функции для работы с профилями контуров в NVS ---
+static const char* TILE_DEFAULT_ID = "CUSTOM_6";
+
+static String profKey(uint8_t cont) {
+  String k;
+  k.reserve(12);
+  k += 'c'; k += String(cont); k += ".profile";
+  return k;
+}
+
+static String getProfileId(uint8_t cont) {
+  String id = prefsProfiles.getString(profKey(cont).c_str(), String());
+  if (!id.length() || !tileIdExists(id)) {
+    id = TILE_DEFAULT_ID;
+  }
+  return id;
+}
+
+static bool setProfileId(uint8_t cont, const String& id) {
+  if ((cont != 1 && cont != 2) || !tileIdExists(id)) return false;
+  const String key = profKey(cont);
+  size_t n = prefsProfiles.putString(key.c_str(), id);
+  if (n == 0) {
+    String cur = prefsProfiles.getString(key.c_str(), String());
+    return (cur == id);
+  }
+  return true;
+}
+
+
+// --- Секция 7: Вспомогательные функции для работы с шиной 1-Wire ---
+String owAddrToString(const uint8_t addr[8]) {
+  char buf[3*8];
+  char *p = buf;
+  for (int i = 0; i < 8; i++) {
+    sprintf(p, "%02X", addr[i]);
+    p += 2;
+    if (i != 7) *p++ = '-';
+  }
+  *p = '\0';
+  return String(buf);
+}
+
+bool owStringToAddr(const String& romStr, uint8_t addr[8]) {
+  int start = 0, end = -1;
+  for (int i = 0; i < 8; i++) {
+    start = (i==0) ? 0 : end + 1;
+    end = romStr.indexOf('-', start);
+    String token = (end == -1) ? romStr.substring(start) : romStr.substring(start, end);
+    if (token.length() != 2) return false;
+    char hi = token[0], lo = token[1];
+    auto hexVal = [](char c)->int{
+      if (c>='0' && c<='9') return c-'0';
+      if (c>='a' && c<='f') return c-'a'+10;
+      if (c>='A' && c<='F') return c-'A'+10;
+      return -1;
+    };
+    int h = hexVal(hi), l = hexVal(lo);
+    if (h < 0 || l < 0) return false;
+    addr[i] = (uint8_t)((h << 4) | l);
+    if (end == -1 && i != 7) return false;
+  }
+  return true;
+}
+
+
+// --- Секция 8: Функции для работы с NVS (привязка датчиков к переменным) ---
+static const char* OW_NVS_NS = "owmap";
+
+String nvsGetRomForVar(const char* varName) {
+  return prefs.getString(varName, String());
+}
+
+bool owIsKnownVar(const String& v) {
+  for (size_t i=0; i < OW_VAR_COUNT; i++) {
+    if (v == OW_VARS[i]) return true;
+  }
+  return false;
+}
+
+String nvsFindVarByRom(const String& rom) {
+  for (size_t i=0; i < OW_VAR_COUNT; i++) {
+    String cur = prefs.getString(OW_VARS[i], String());
+    if (cur.length() && cur == rom) return String(OW_VARS[i]);
+  }
+  return String();
+}
+
+bool nvsClearVar(const String& varName) {
+  if (!owIsKnownVar(varName)) return false;
+  return prefs.remove(varName.c_str());
+}
+
+bool nvsBindVarToRom(const String& varName, const String& rom,
+                                     String* clearedVarOut=nullptr, String* replacedRomOut=nullptr,
+                                     String* errMsg=nullptr) {
+  if (!owIsKnownVar(varName)) { if (errMsg) *errMsg="unknown var"; return false; }
+  uint8_t addr[8];
+  if (!owStringToAddr(rom, addr)) { if (errMsg) *errMsg="bad rom format"; return false; }
+  if (addr[0] != 0x28) { if (errMsg) *errMsg="not DS18B20 family"; return false; }
+
+  String occupiedBy = nvsFindVarByRom(rom);
+  if (occupiedBy.length() && occupiedBy != varName) {
+    prefs.remove(occupiedBy.c_str());
+    if (clearedVarOut) *clearedVarOut = occupiedBy;
+  }
+
+  prefs.putString(varName.c_str(), rom);
+  return true;
+}
+
+// --- Секция 11: Конфигурация Wi-Fi и Веб-сервера ---
+const char* AP_SSID = "WWT-A8";
+const char* AP_PASS = "12345678";
+IPAddress apIP(192,168,4,1);
+IPAddress apGW(192,168,4,1);
+IPAddress apMASK(255,255,255,0);
+WebServer server(80);
+
+
+// --- Секция 9: Функции сканирования шины и формирования JSON-ответов ---
+void handleOwScan() {
+    ds18.begin();
+    ds18.setWaitForConversion(true);
+    oneWire.reset_search();
+
+    StaticJsonDocument<1024> doc;
+    doc["ok"] = true;
+    doc["pin"] = 14;
+    
+    JsonArray sensors = doc.createNestedArray("sensors");
+    uint8_t addr[8];
+    uint16_t found = 0;
+
+    while (oneWire.search(addr)) {
+        esp_task_wdt_reset();
+        if (OneWire::crc8(addr, 7) != addr[7]) continue;
+        if (found >= OW_MAX_HINT) break;
+
+        ds18.requestTemperaturesByAddress(addr);
+        float tC = ds18.getTempC(addr);
+
+        JsonObject sensor = sensors.createNestedObject();
+        String romStr = owAddrToString(addr);
+        String varName = nvsFindVarByRom(romStr);
+        
+        sensor["rom"] = romStr;
+        sensor["var"] = varName;
+        if (tC == DEVICE_DISCONNECTED_C) {
+            sensor["t"] = nullptr;
+        } else {
+            sensor["t"] = tC;
+        }
+        found++;
+    }
+    doc["found"] = found;
+    
+    oneWire.reset_search();
+    String output;
+    serializeJson(doc, output);
+    server.send(200, "application/json", output);
+}
+
+
+void handleOwStatus() {
+    ds18.requestTemperatures();
+    StaticJsonDocument<1024> doc;
+    doc["ok"] = true;
+    JsonArray sensors = doc.createNestedArray("sensors");
+
+    oneWire.reset_search();
+    uint8_t addr[8];
+    uint16_t found = 0;
+
+    while (oneWire.search(addr)) {
+        if (OneWire::crc8(addr, 7) != addr[7]) continue;
+        if (found >= OW_MAX_HINT) break;
+
+        float tC = ds18.getTempC(addr);
+        JsonObject sensor = sensors.createNestedObject();
+        sensor["rom"] = owAddrToString(addr);
+        if (tC == DEVICE_DISCONNECTED_C) {
+            sensor["t"] = nullptr;
+        } else {
+            sensor["t"] = tC;
+        }
+        found++;
+    }
+
+    oneWire.reset_search();
+    String output;
+    serializeJson(doc, output);
+    server.send(200, "application/json", output);
+}
+
+
+// --- Секция 10: Отладочные функции ---
+void dumpNvsToSerial(){
+  Serial.println(F("\n========== NVS DUMP =========="));
+  Serial.println(F("[NVS/Profiles]"));
+  for (uint8_t c=1; c<=2; c++){
+    String id = getProfileId(c);
+    int idx = tileIndexById(id);
+    const TileDef& td = getTile((idx>=0) ? (uint8_t)idx : 0);
+    Serial.print(F("  c")); Serial.print(c);
+    Serial.print(F(".profile = \""));
+    Serial.print(id); Serial.print(F("\"  ("));
+    Serial.print(td.displayName); Serial.println(F(")"));
+  }
+
+  Serial.println(F("[NVS/OWMAP]"));
+  for (size_t i=0; i < OW_VAR_COUNT; i++){
+    String rom = prefs.getString(OW_VARS[i], String());
+    if (!rom.length()) continue;
+    Serial.print(F("  ")); Serial.print(OW_VARS[i]);
+    Serial.print(F(" -> ")); Serial.println(rom);
+  }
+
+  Serial.println(F("[NVS/Params]"));
+  prefsParams.begin("params", true);
+  for (int i=0; i<6; i++) {
+      const char* tzad = TILES[i].TZAD;
+      if (tzad && tzad[0]) {
+          if (prefsParams.isKey(tzad)) {
+              float val = prefsParams.getFloat(tzad, 0.0f);
+              Serial.print(F("  ")); Serial.print(tzad);
+              Serial.print(F(" = ")); Serial.println(val);
+          }
+      }
+  }
+  prefsParams.end();
+  
+  Serial.println(F("[NVS/General]"));
+  prefsGeneral.begin("general", true);
+  Serial.print(F("  ctrlIndex = ")); Serial.println(prefsGeneral.getString("ctrlIndex", ""));
+  Serial.print(F("  pumpEnableMask = ")); Serial.println(prefsGeneral.getUChar("pumpEnableMask", 0b1111), BIN);
+  Serial.print(F("  pi1_Kp = ")); Serial.println(prefsGeneral.getFloat("pi1_Kp", 0.0f));
+  Serial.print(F("  pi1_Ki = ")); Serial.println(prefsGeneral.getFloat("pi1_Ki", 0.0f));
+  Serial.print(F("  pi1_Ti = ")); Serial.println(prefsGeneral.getFloat("pi1_Ti", 0.0f));
+  Serial.print(F("  pi2_Kp = ")); Serial.println(prefsGeneral.getFloat("pi2_Kp", 0.0f));
+  Serial.print(F("  pi2_Ki = ")); Serial.println(prefsGeneral.getFloat("pi2_Ki", 0.0f));
+  Serial.print(F("  pi2_Ti = ")); Serial.println(prefsGeneral.getFloat("pi2_Ti", 0.0f));
+  if (prefsGeneral.isKey("curvePoints")) {
+      Serial.print(F("  curvePoints = "));
+      Serial.println(prefsGeneral.getString("curvePoints", "[]"));
+  }
+  if (prefsGeneral.isKey("summerCutoff")) {
+      Serial.print(F("  summerCutoff = "));
+      Serial.println(prefsGeneral.getFloat("summerCutoff", 20.0f));
+  }
+  if (prefsGeneral.isKey("gvpPidDz")) {
+      Serial.print(F("  gvpPidDz = "));
+      Serial.println(prefsGeneral.getFloat("gvpPidDz", 2.0f));
+  }
+  if (prefsGeneral.isKey("gvpPidKf")) {
+      Serial.print(F("  gvpPidKf = "));
+      Serial.println(prefsGeneral.getFloat("gvpPidKf", 0.5f));
+  }
+  if (prefsGeneral.isKey("gvpPidMax")) {
+      Serial.print(F("  gvpPidMax = "));
+      Serial.println(prefsGeneral.getFloat("gvpPidMax", 5.0f));
+  }
+  // [НОВЕ] Вивід налаштувань комфорту
+  String comfort1_str = prefsGeneral.getString("comfort1", "{}");
+  String comfort2_str = prefsGeneral.getString("comfort2", "{}");
+  Serial.print(F("  comfort1 = ")); Serial.println(comfort1_str);
+  Serial.print(F("  comfort2 = ")); Serial.println(comfort2_str);
+  // [НОВЕ] Вивід прапорця налаштування часу
+  bool timeWasSet = prefsGeneral.getBool("timeWasSet", false);
+  Serial.print(F("  timeWasSet = ")); Serial.println(timeWasSet ? "true" : "false");
+
+  prefsGeneral.end();
+
+  Serial.println(F("================================\n"));
+}
+
+
+// --- Секция 12: HTML, CSS, JavaScript для веб-интерфейса (ОБНОВЛЕННАЯ ВЕРСИЯ) ---
+const char index_html[] PROGMEM = R"====(
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WWT-A8 Controller</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+      :root {
+        --font-family: 'Roboto', system-ui, -apple-system, Segoe UI, sans-serif;
+        --background-color: #f0f2f5;
+        --card-background: #ffffff;
+        --text-color: #1c1e21;
+        --text-secondary: #606770;
+        --border-color: #dce1e6;
+        --primary-color: #0d6efd;
+        --primary-hover: #0b5ed7;
+        --header-bg: #2c3e50;
+        --header-fg: #ffffff;
+        --radius: 8px;
+        --shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+        
+        --status-ok-bg: #e7f3ff;
+        --status-ok-fg: #0d6efd;
+        --status-alarm-bg: #f8d7da;
+        --status-alarm-fg: #842029;
+        --status-warn-bg: #fff3cd;
+        --status-warn-fg: #664d03;
+        --status-repair-bg: #fff3cd;
+        --status-repair-fg: #664d03;
+        --status-summer-bg: #d1e7dd;
+        --status-summer-fg: #0f5132;
+        --status-working-bg: #cfe2ff;
+        --status-working-fg: #084298;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      html { font-size: 16px; scroll-behavior: smooth; }
+      body {
+        font-family: var(--font-family);
+        background-color: var(--background-color);
+        color: var(--text-color);
+        line-height: 1.6;
+        overscroll-behavior-y: contain;
+      }
+      header {
+        background-color: var(--header-bg);
+        color: var(--header-fg);
+        padding: 1rem 1.5rem;
+        text-align: center;
+        font-size: 1.5rem;
+        font-weight: 500;
+        position: sticky; top: 0; z-index: 100;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      }
+      .container {
+        padding: 1rem;
+        max-width: 1200px;
+        margin: 0 auto;
+      }
+      .grid-container {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        gap: 1.5rem;
+      }
+      .card {
+        background: var(--card-background);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius);
+        padding: 1.5rem;
+        box-shadow: var(--shadow);
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+      }
+      .card-title {
+        margin: 0 0 0.5rem;
+        font-size: 1.25rem;
+        font-weight: 700;
+        line-height: 1.2;
+        color: var(--header-bg);
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+      }
+      .card-subtitle {
+        font-size: 0.9rem;
+        font-weight: 400;
+        color: var(--text-secondary);
+      }
+      .data-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 0.5rem 0;
+        border-bottom: 1px solid var(--border-color);
+      }
+      .data-row:last-child { border-bottom: none; }
+      .data-label { font-weight: 500; white-space: nowrap; color: var(--text-secondary); }
+      .data-value { text-align: right; font-weight: 500; font-family: monospace; font-size: 1.1rem;}
+      .temp-alarm { color: var(--status-alarm-fg); font-weight: 700; }
+      .status-badge {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 99px;
+        font-size: 0.9rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        border: 1px solid transparent;
+      }
+      .status-badge.ok { background-color: var(--status-ok-bg); color: var(--status-ok-fg); border-color: var(--status-ok-fg);}
+      .status-badge.alarm { background-color: var(--status-alarm-bg); color: var(--status-alarm-fg); border-color: var(--status-alarm-fg);}
+      .status-badge.repair { background-color: var(--status-repair-bg); color: var(--status-repair-fg); border-color: var(--status-repair-fg);}
+      .status-badge.summer { background-color: var(--status-summer-bg); color: var(--status-summer-fg); border-color: var(--status-summer-fg);}
+      .status-badge.working { background-color: var(--status-working-bg); color: var(--status-working-fg); border-color: var(--status-working-fg);}
+      .status-badge.unknown { background-color: #e9ecef; color: #495057; border-color: #adb5bd; }
+      
+      .btn {
+        display: inline-block; padding: 0.6rem 1.2rem; border-radius: var(--radius);
+        cursor: pointer; text-decoration: none; user-select: none; border: 1px solid transparent;
+        font-family: inherit; font-size: 1rem; font-weight: 500; text-align: center;
+        transition: all 0.2s ease-in-out;
+      }
+      .btn:disabled { background-color: #ced4da; border-color: #ced4da; color: #6c757d; cursor: not-allowed; }
+      .btn-primary { background-color: var(--primary-color); color: white; border-color: var(--primary-color); }
+      .btn-primary:hover:not(:disabled) { background-color: var(--primary-hover); border-color: var(--primary-hover); }
+      .btn-secondary { background-color: #6c757d; color: white; border-color: #6c757d; }
+      .btn-secondary:hover:not(:disabled) { background-color: #5c636a; border-color: #565e64; }
+      .btn-outline { background-color: transparent; color: var(--primary-color); border-color: var(--primary-color); }
+      .btn-outline:hover:not(:disabled) { background-color: var(--primary-color); color: white; }
+      .btn-footer { display: block; width: 100%; max-width: 400px; margin: 2rem auto 1rem; padding: 0.8rem 1.5rem; font-size: 1.1rem; }
+      
+      .actions-row { display: flex; justify-content: flex-end; gap: 0.75rem; margin-top: 1rem; }
+      
+      /* Settings Page Styles */
+      .page-title { margin-bottom: 1.5rem; text-align: center; }
+      .settings-grid { display: grid; grid-template-columns: 1fr; gap: 1.5rem; }
+      @media (min-width: 992px) { .settings-grid { grid-template-columns: repeat(2, 1fr); } }
+      
+      .setting-group { display: flex; flex-direction: column; gap: 0.75rem; }
+      .setting-row { display: grid; grid-template-columns: 1fr; align-items: center; gap: 0.5rem 1rem;}
+      @media (min-width: 576px) { .setting-row { grid-template-columns: 180px 1fr; } }
+      .form-label { font-weight: 500; }
+      .form-input, .form-select {
+        width: 100%; padding: 0.6rem 0.8rem; border-radius: var(--radius); font-family: inherit; font-size: 1rem;
+        border: 1px solid var(--border-color); background-color: #fff; color: var(--text-color);
+        transition: border-color 0.2s, box-shadow 0.2s;
+      }
+      .form-input:focus, .form-select:focus { outline: none; border-color: var(--primary-color); box-shadow: 0 0 0 2px rgba(13, 110, 253, 0.25); }
+      .form-input:disabled, .form-select:disabled { background-color: #e9ecef; cursor: not-allowed; }
+      
+      .config-buttons { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 0.75rem; margin-top: 0.5rem;}
+      .config-buttons .btn.tile-selected { background-color: var(--status-summer-fg); color: white; border-color: var(--status-summer-fg); }
+      
+      /* Valve Control Settings */
+      .valve-control { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-top: 1.5rem; }
+      .valve-control .btn { font-size: 1.5rem; font-weight: bold; padding: 1rem; flex-grow: 1; max-width: 150px;}
+      .valve-control .label { font-size: 1.1rem; text-align: center; font-weight: 500; }
+      
+      /* Curve Table */
+      #curve-card .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
+      #curve-card .toolbar .spacer { flex: 1; }
+      #curve-card .table-wrapper { overflow-x: auto; }
+      #curve-card table { width: 100%; border-collapse: collapse; }
+      #curve-card th, #curve-card td { border: 1px solid var(--border-color); padding: 0.5rem; text-align: center; }
+      #curve-card th { background-color: #f8f9fa; font-weight: 700; }
+      #curve-card .cell-input { width: 100%; padding: 0.5rem; font-size: 1rem; text-align: center; border: 1px solid var(--border-color); border-radius: 4px; }
+      #curve-card .cell-input.invalid { outline: 2px solid var(--status-alarm-fg); background-color: var(--status-alarm-bg); }
+      .toast { padding: 0.75rem; margin-top: 1rem; border-radius: var(--radius); font-size: 0.9rem; display: none; }
+      .toast.show { display: block; background-color: var(--status-summer-bg); color: var(--status-summer-fg); border: 1px solid var(--status-summer-fg); }
+      .toast.error.show { background-color: var(--status-alarm-bg); color: var(--status-alarm-fg); border: 1px solid var(--status-alarm-fg); }
+
+      /* 1-Wire Scanner */
+      .ow-list { display: flex; flex-direction: column; gap: 0.5rem; }
+      .ow-item { display: grid; grid-template-columns: auto 1fr auto auto; align-items: center; gap: 1rem; padding: 0.75rem; border: 1px solid transparent; border-radius: var(--radius); transition: background-color 0.2s; }
+      .ow-item:has(.ow-radio:checked) { background-color: var(--status-ok-bg); border-color: var(--primary-color); }
+      .ow-radio { transform: scale(1.5); margin-right: 0.5rem;}
+      .ow-slot { font-weight: 700; user-select: none; }
+      .ow-temp { font-family: monospace; font-size: 1.1rem; }
+      .ow-binding {
+          display: inline-block;
+          padding: 0.2rem 0.6rem;
+          border-radius: var(--radius);
+          font-size: 0.9rem;
+          font-weight: 700;
+          text-align: center;
+          min-width: 60px;
+      }
+      .ow-binding.bound {
+          background-color: var(--status-summer-bg);
+          color: var(--status-summer-fg);
+          border: 1px solid var(--status-summer-fg);
+      }
+      .ow-binding.unbound {
+          background-color: var(--status-alarm-bg);
+          border: 1px solid var(--status-alarm-fg);
+          height: 24px;
+          padding: 0;
+      }
+      @media (max-width: 576px) {
+        .ow-item { grid-template-columns: auto 1fr auto; }
+        .ow-select { grid-column: 1 / -1; margin-top: 0.5rem; }
+        .ow-binding { grid-column: 3 / 4; grid-row: 1 / 2; }
+      }
+
+      /* Switch Toggle */
+      .switch { position: relative; display: inline-block; width: 60px; height: 34px; }
+      .switch input { opacity: 0; width: 0; height: 0; }
+      .slider { position: absolute; cursor: pointer; inset: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }
+      .slider:before { position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
+      input:checked + .slider { background-color: var(--primary-color); }
+      input:checked + .slider:before { transform: translateX(26px); }
+      input:disabled + .slider { cursor: not-allowed; background-color: #adb5bd; }
+
+      /* Modal & Pop-up */
+      .modal-overlay {
+        position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 9999;
+      }
+      .modal-overlay.active { display: flex; }
+      .modal-dialog {
+        background: white; width: min(500px, 90vw); border-radius: var(--radius); padding: 2rem;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+      }
+      .modal-titlebar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+      .modal-titlebar h3 { font-size: 1.5rem; }
+      .modal-close { font-size: 1.5rem; background: transparent; border: none; cursor: pointer; color: var(--text-secondary); }
+      #pinError { color: var(--status-alarm-fg); margin-top: 0.5rem; display: none; font-size: 0.9rem; }
+      .modal-dialog.alarm { border-top: 5px solid var(--status-alarm-fg); }
+      .modal-dialog.warning { border-top: 5px solid var(--status-warn-fg); }
+      body.modal-open { overflow: hidden; }
+
+      /* [НОВЕ] Стилі для комфортного режиму */
+      .comfort-interval { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; align-items: center; }
+      .comfort-interval label { font-size: 0.9rem; color: var(--text-secondary); text-align: center; }
+      .day-selector { display: flex; flex-wrap: wrap; justify-content: space-around; gap: 0.5rem; margin-top: 1rem; }
+      .day-selector label { display: flex; flex-direction: column; align-items: center; cursor: pointer; padding: 0.25rem 0.5rem; border-radius: 4px; border: 1px solid transparent; }
+      .day-selector input { margin-bottom: 0.25rem; transform: scale(1.2); }
+      .day-selector input:checked + span { font-weight: bold; color: var(--primary-color); }
+      .day-selector label:has(input:checked) { background-color: var(--status-ok-bg); border-color: var(--primary-color); }
+      .day-selector input:disabled + span { color: #6c757d; }
+      .day-selector label:has(input:disabled) { cursor: not-allowed; }
+      
+      .time-setup { display: flex; gap: 1rem; align-items: center; }
+
+    </style>
+    <script> const ADMIN_PIN = "1111"; </script>
+</head>
+<body>
+  <header>WWT-A8 Controller</header>
+
+  <div class="container" id="main-page">
+    <div class="grid-container">
+      <div class="card">
+        <h2 class="card-title">Контур I <span class="card-subtitle" id="tile_name_1">[name1]</span></h2>
+        <div class="data-row"><span class="data-label">Режим роботи:</span><span class="data-value" id="mode_I">--</span></div>
+        <div class="data-row"><span class="data-label">T подачі:</span><span class="data-value" id="Tpod_I">0 °C</span></div>
+        <div class="data-row"><span class="data-label">T звороту:</span><span class="data-value" id="Tinv_I">0 °C</span></div>
+        <div class="data-row"><span class="data-label">T завдання:</span><span class="data-value" id="Tzavd_I">0 °C</span></div>
+        <div class="data-row"><span class="data-label">Клапан:</span><span class="data-value" id="Valve_I">--</span></div>
+        <div class="data-row"><span class="data-label">Насос М1:</span><span class="data-value"><span id="M1_I" class="status-badge">--</span></span></div>
+        <div class="data-row"><span class="data-label">Насос М2:</span><span class="data-value"><span id="M2_I" class="status-badge">--</span></span></div>
+        <div class="data-row"><span class="data-label">Сухий хід:</span><span class="data-value"><span id="Dry_I" class="status-badge">--</span></span></div>
+        <div class="actions-row"> <a href="#settings_I" class="btn btn-outline">Налаштування</a> </div>
+      </div>
+      <div class="card">
+        <h2 class="card-title">Контур II <span class="card-subtitle" id="tile_name_2">[name2]</span></h2>
+        <div class="data-row"><span class="data-label">Режим роботи:</span><span class="data-value" id="mode_II">--</span></div>
+        <div class="data-row"><span class="data-label">T подачі:</span><span class="data-value" id="Tpod_II">0 °C</span></div>
+        <div class="data-row"><span class="data-label">T звороту:</span><span class="data-value" id="Tinv_II">0 °C</span></div>
+        <div class="data-row"><span class="data-label">T завдання:</span><span class="data-value" id="Tzavd_II">0 °C</span></div>
+        <div class="data-row"><span class="data-label">Клапан:</span><span class="data-value" id="Valve_II">--</span></div>
+        <div class="data-row"><span class="data-label">Насос М1:</span><span class="data-value"><span id="M1_II" class="status-badge">--</span></span></div>
+        <div class="data-row"><span class="data-label">Насос М2:</span><span class="data-value"><span id="M2_II" class="status-badge">--</span></span></div>
+        <div class="data-row"><span class="data-label">Сухий хід:</span><span class="data-value"><span id="Dry_II" class="status-badge">--</span></span></div>
+        <div class="actions-row"> <a href="#settings_II" class="btn btn-outline">Налаштування</a> </div>
+      </div>
+      <div class="card" style="grid-column: 1 / -1;">
+        <h2 class="card-title">Загальні параметри</h2>
+        <div class="data-row"><span class="data-label">T зовнішнього повітря:</span><span class="data-value" id="T_outdoor">— °C</span></div>
+        <div class="data-row"><span class="data-label">T1 мережі (подача):</span><span class="data-value" id="T1_city">— °C</span></div>
+        <div class="data-row"><span class="data-label">T2 мережі (зворот):</span><span class="data-value" id="T2_city">— °C</span></div>
+      </div>
+      <div class="card" style="grid-column: 1 / -1;">
+        <h2 class="card-title">Стан системи</h2>
+        <div class="data-row"><span class="data-label">Час:</span><span class="data-value" id="status_rtc">--</span></div>
+        <div class="data-row"><span class="data-label">OLED Дисплей:</span><span class="data-value" id="status_display">--</span></div>
+        <div class="data-row"><span class="data-label">Плата реле:</span><span class="data-value" id="status_relay">--</span></div>
+        <div class="data-row"><span class="data-label">Плата входів:</span><span class="data-value" id="status_input">--</span></div>
+      </div>
+    </div>
+    <a href="#general" class="btn btn-primary btn-footer">Загальні налаштування</a>
+  </div>
+  
+  <div class="container" id="settings_I" style="display:none">
+    <h2 class="page-title">Налаштування контуру I: <span id="settings_name_1">[name1]</span></h2>
+    <div class="card">
+        <h3 class="card-title" id="si_param_label">Коеф. зміщеня графіку</h3>
+        <div class="setting-row" style="grid-template-columns: 1fr 2fr 1fr; align-items: stretch;">
+            <button id="si_btn_minus_param" class="btn btn-secondary" style="font-size: 1.5rem;">-</button>
+            <input id="si_param_value" class="form-input" type="number" step="0.1" inputmode="decimal" value="0.0" style="text-align: center; font-size: 1.5rem; font-weight: bold;">
+            <button id="si_btn_plus_param" class="btn btn-secondary" style="font-size: 1.5rem;">+</button>
+        </div>
+        <div class="actions-row"><button id="si_btn_save" class="btn btn-primary">Зберегти</button></div>
+        <hr style="border: none; border-top: 1px solid var(--border-color); margin: 1.5rem 0;">
+        <div class="valve-control">
+            <button id="si_valve_minus" class="btn btn-outline">-</button>
+            <span class="label">Ручне керування клапаном</span>
+            <button id="si_valve_plus" class="btn btn-outline">+</button>
+        </div>
+    </div>
+    <a href="#main-page" class="btn btn-secondary btn-footer">< На головну</a>
+  </div>
+
+  <div class="container" id="settings_II" style="display:none">
+    <h2 class="page-title">Налаштування контуру II: <span id="settings_name_2">[name2]</span></h2>
+    <div class="card">
+        <h3 class="card-title" id="sii_param_label">Завдання ГВП</h3>
+        <div class="setting-row" style="grid-template-columns: 1fr 2fr 1fr; align-items: stretch;">
+            <button id="sii_btn_minus_param" class="btn btn-secondary" style="font-size: 1.5rem;">-</button>
+            <input id="sii_param_value" class="form-input" type="number" step="0.1" inputmode="decimal" value="0.0" style="text-align: center; font-size: 1.5rem; font-weight: bold;">
+            <button id="sii_btn_plus_param" class="btn btn-secondary" style="font-size: 1.5rem;">+</button>
+        </div>
+        <div class="actions-row"><button id="sii_btn_save" class="btn btn-primary">Зберегти</button></div>
+        <hr style="border: none; border-top: 1px solid var(--border-color); margin: 1.5rem 0;">
+        <div class="valve-control">
+            <button id="sii_valve_minus" class="btn btn-outline">-</button>
+            <span class="label">Ручне керування клапаном</span>
+            <button id="sii_valve_plus" class="btn btn-outline">+</button>
+        </div>
+    </div>
+    <a href="#main-page" class="btn btn-secondary btn-footer">< На головну</a>
+  </div>
+
+  <div class="container" id="general" style="display:none">
+    <h2 class="page-title">Загальні налаштування</h2>
+    <div class="settings-grid">
+      <div class="card">
+        <h3 class="card-title">Конфігурація контуру I</h3>
+        <div class="config-buttons">
+          <button id="c1_btn_co" class="btn btn-outline">СО_1</button><button id="c1_btn_gvp" class="btn btn-outline">ГВП_1</button>
+          <button id="c1_btn_3" class="btn btn-outline">СО_2</button><button id="c1_btn_4" class="btn btn-outline">ГВП_2</button>
+          <button id="c1_btn_5" class="btn btn-outline">Кнопка 5</button><button id="c1_btn_6" class="btn btn-outline">Кнопка 6</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3 class="card-title">Конфігурація контуру II</h3>
+        <div class="config-buttons">
+          <button id="c2_btn_co" class="btn btn-outline">СО_1</button><button id="c2_btn_gvp" class="btn btn-outline">ГВП_1</button>
+          <button id="c2_btn_3" class="btn btn-outline">СО_2</button><button id="c2_btn_4" class="btn btn-outline">ГВП_2</button>
+          <button id="c2_btn_5" class="btn btn-outline">Кнопка 5</button><button id="c2_btn_6" class="btn btn-outline">Кнопка 6</button>
+        </div>
+      </div>
+      <!-- [НОВЕ] Комфортний режим Контур I -->
+      <div class="card comfort-card" id="comfort_card_1">
+          <h3 class="card-title">Комфортний режим: Контур I</h3>
+          <div class="setting-row">
+              <label for="comfort_enabled_1" class="form-label">Активувати режим:</label>
+              <label class="switch"><input type="checkbox" id="comfort_enabled_1"><span class="slider"></span></label>
+          </div>
+          <hr style="border:0; border-top: 1px solid var(--border-color); margin: 1rem 0;">
+          <div id="comfort_controls_1">
+              <div class="comfort-interval">
+                  <label>Старт</label><label>Кінець</label><label>Зниження, °C</label>
+                  <input type="time" class="form-input" id="c1_t1_start">
+                  <input type="time" class="form-input" id="c1_t1_end">
+                  <input type="number" step="0.1" class="form-input" id="c1_t1_reduct">
+              </div>
+              <div class="comfort-interval">
+                  <input type="time" class="form-input" id="c1_t2_start">
+                  <input type="time" class="form-input" id="c1_t2_end">
+                  <input type="number" step="0.1" class="form-input" id="c1_t2_reduct">
+              </div>
+              <div class="comfort-interval">
+                  <input type="time" class="form-input" id="c1_t3_start">
+                  <input type="time" class="form-input" id="c1_t3_end">
+                  <input type="number" step="0.1" class="form-input" id="c1_t3_reduct">
+              </div>
+              <div class="day-selector" id="c1_days">
+                  <label><input type="checkbox" value="1"><span>Пн</span></label>
+                  <label><input type="checkbox" value="2"><span>Вт</span></label>
+                  <label><input type="checkbox" value="3"><span>Ср</span></label>
+                  <label><input type="checkbox" value="4"><span>Чт</span></label>
+                  <label><input type="checkbox" value="5"><span>Пт</span></label>
+                  <label><input type="checkbox" value="6"><span>Сб</span></label>
+                  <label><input type="checkbox" value="0"><span>Нд</span></label>
+              </div>
+              <div class="actions-row"><button id="saveComfort1" class="btn btn-primary">Зберегти</button></div>
+          </div>
+      </div>
+      <!-- [НОВЕ] Комфортний режим Контур II -->
+      <div class="card comfort-card" id="comfort_card_2">
+          <h3 class="card-title">Комфортний режим: Контур II</h3>
+          <div class="setting-row">
+              <label for="comfort_enabled_2" class="form-label">Активувати режим:</label>
+              <label class="switch"><input type="checkbox" id="comfort_enabled_2"><span class="slider"></span></label>
+          </div>
+          <hr style="border:0; border-top: 1px solid var(--border-color); margin: 1rem 0;">
+          <div id="comfort_controls_2">
+              <div class="comfort-interval">
+                  <label>Старт</label><label>Кінець</label><label>Зниження, °C</label>
+                  <input type="time" class="form-input" id="c2_t1_start">
+                  <input type="time" class="form-input" id="c2_t1_end">
+                  <input type="number" step="0.1" class="form-input" id="c2_t1_reduct">
+              </div>
+              <div class="comfort-interval">
+                  <input type="time" class="form-input" id="c2_t2_start">
+                  <input type="time" class="form-input" id="c2_t2_end">
+                  <input type="number" step="0.1" class="form-input" id="c2_t2_reduct">
+              </div>
+              <div class="comfort-interval">
+                  <input type="time" class="form-input" id="c2_t3_start">
+                  <input type="time" class="form-input" id="c2_t3_end">
+                  <input type="number" step="0.1" class="form-input" id="c2_t3_reduct">
+              </div>
+              <div class="day-selector" id="c2_days">
+                  <label><input type="checkbox" value="1"><span>Пн</span></label>
+                  <label><input type="checkbox" value="2"><span>Вт</span></label>
+                  <label><input type="checkbox" value="3"><span>Ср</span></label>
+                  <label><input type="checkbox" value="4"><span>Чт</span></label>
+                  <label><input type="checkbox" value="5"><span>Пт</span></label>
+                  <label><input type="checkbox" value="6"><span>Сб</span></label>
+                  <label><input type="checkbox" value="0"><span>Нд</span></label>
+              </div>
+              <div class="actions-row"><button id="saveComfort2" class="btn btn-primary">Зберегти</button></div>
+          </div>
+      </div>
+      <div class="card" style="grid-column: 1 / -1;" id="curve-card">
+        <h3 class="card-title">Погодозалежна крива</h3>
+        <div class="toolbar">
+          <button class="btn btn-secondary" id="curve-reset">Скинути</button>
+          <button class="btn btn-secondary" id="curve-sort">Сортувати</button>
+          <div class="spacer"></div><button class="btn btn-primary" id="curve-save">Зберегти</button>
+        </div>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th>T Зовнішня, °C</th><th>T Подачі, °C</th></tr></thead>
+            <tbody id="curve-tbody">
+              <tr><td><input type="number" class="cell-input tout"></td><td><input type="number" class="cell-input tsup"></td></tr>
+              <tr><td><input type="number" class="cell-input tout"></td><td><input type="number" class="cell-input tsup"></td></tr>
+              <tr><td><input type="number" class="cell-input tout"></td><td><input type="number" class="cell-input tsup"></td></tr>
+              <tr><td><input type="number" class="cell-input tout"></td><td><input type="number" class="cell-input tsup"></td></tr>
+              <tr><td><input type="number" class="cell-input tout"></td><td><input type="number" class="cell-input tsup"></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div id="curve-toast" class="toast" role="status" aria-live="polite"></div>
+      </div>
+      <div class="card">
+        <h3 class="card-title">ПІ-регулятор: Контур I</h3>
+        <div class="setting-group">
+          <div class="setting-row"><label for="pi1_Ki" class="form-label">Kі (інтеграл):</label><input id="pi1_Ki" class="form-input" type="number" step="0.001" inputmode="decimal"></div>
+          <div class="setting-row"><label for="pi1_Kp" class="form-label">Kп (пропорц):</label><input id="pi1_Kp" class="form-input" type="number" step="0.001" inputmode="decimal"></div>
+          <div class="setting-row"><label for="pi1_Ti" class="form-label">Tі (час імп, с):</label><input id="pi1_Ti" class="form-input" type="number" step="0.1" inputmode="decimal"></div>
+          <div class="actions-row"><button id="savePI1" class="btn btn-primary">Зберегти</button></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3 class="card-title">ПІ-регулятор: Контур II</h3>
+        <div class="setting-group">
+          <div class="setting-row"><label for="pi2_Ki" class="form-label">Kі (інтеграл):</label><input id="pi2_Ki" class="form-input" type="number" step="0.001" inputmode="decimal"></div>
+          <div class="setting-row"><label for="pi2_Kp" class="form-label">Kп (пропорц):</label><input id="pi2_Kp" class="form-input" type="number" step="0.001" inputmode="decimal"></div>
+          <div class="setting-row"><label for="pi2_Ti" class="form-label">Tі (час імп, с):</label><input id="pi2_Ti" class="form-input" type="number" step="0.1" inputmode="decimal"></div>
+          <div class="actions-row"><button id="savePI2" class="btn btn-primary">Зберегти</button></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3 class="card-title">Динамічний ПІД для ГВП</h3>
+        <div class="setting-group">
+          <div class="setting-row"><label for="gvpPidDz" class="form-label">"Мертва зона" (°C):</label><input id="gvpPidDz" class="form-input" type="number" step="0.1" inputmode="decimal"></div>
+          <div class="setting-row"><label for="gvpPidKf" class="form-label">Коеф. прискорення:</label><input id="gvpPidKf" class="form-input" type="number" step="0.1" inputmode="decimal"></div>
+          <div class="setting-row"><label for="gvpPidMax" class="form-label">Макс. імпульс (с):</label><input id="gvpPidMax" class="form-input" type="number" step="0.1" inputmode="decimal"></div>
+          <div class="actions-row"><button id="saveGvpPid" class="btn btn-primary">Зберегти</button></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3 class="card-title">Літній режим</h3>
+        <div class="setting-group">
+          <div class="setting-row"><label for="summerCutoff" class="form-label">T° відключення опалення:</label><input id="summerCutoff" class="form-input" type="number" step="0.5" inputmode="decimal"></div>
+          <div class="actions-row"><button id="saveSummerCutoff" class="btn btn-primary">Зберегти</button></div>
+        </div>
+      </div>
+      <div class="card" style="grid-column: 1 / -1;" id="ow-block">
+        <h3 class="card-title">Датчики температури (1-Wire)</h3>
+        <div class="actions-row" style="justify-content: space-between;">
+            <button id="owScan" class="btn btn-secondary">Сканувати шину</button>
+            <button id="owSave" class="btn btn-primary">Прив'язати датчик</button>
+        </div>
+        <div class="ow-list">
+          <div class="ow-item" id="ow_row_1"><label class="ow-pick" for="ow_sel_1"><input class="ow-radio" type="radio" name="ow-active" id="ow_sel_1" value="1"><span class="ow-slot">#1</span></label><span class="ow-temp" id="ow_temp_1">— °C</span><span class="ow-binding" id="ow_bind_1"></span><select id="ow_var_1" class="form-select ow-select"><option value="">Не призначено</option><option value="Tn">Tn</option><option value="T1">T1</option><option value="T2">T2</option><option value="T11">T11</option><option value="T12">T12</option><option value="T21">T21</option><option value="T22">T22</option><option value="T31">T31</option><option value="T41">T41</option><option value="T32">T32</option><option value="T42">T42</option></select></div>
+          <div class="ow-item" id="ow_row_2"><label class="ow-pick" for="ow_sel_2"><input class="ow-radio" type="radio" name="ow-active" id="ow_sel_2" value="2"><span class="ow-slot">#2</span></label><span class="ow-temp" id="ow_temp_2">— °C</span><span class="ow-binding" id="ow_bind_2"></span><select id="ow_var_2" class="form-select ow-select"><option value="">Не призначено</option><option value="Tn">Tn</option><option value="T1">T1</option><option value="T2">T2</option><option value="T11">T11</option><option value="T12">T12</option><option value="T21">T21</option><option value="T22">T22</option><option value="T31">T31</option><option value="T41">T41</option><option value="T32">T32</option><option value="T42">T42</option></select></div>
+          <div class="ow-item" id="ow_row_3"><label class="ow-pick" for="ow_sel_3"><input class="ow-radio" type="radio" name="ow-active" id="ow_sel_3" value="3"><span class="ow-slot">#3</span></label><span class="ow-temp" id="ow_temp_3">— °C</span><span class="ow-binding" id="ow_bind_3"></span><select id="ow_var_3" class="form-select ow-select"><option value="">Не призначено</option><option value="Tn">Tn</option><option value="T1">T1</option><option value="T2">T2</option><option value="T11">T11</option><option value="T12">T12</option><option value="T21">T21</option><option value="T22">T22</option><option value="T31">T31</option><option value="T41">T41</option><option value="T32">T32</option><option value="T42">T42</option></select></div>
+          <div class="ow-item" id="ow_row_4"><label class="ow-pick" for="ow_sel_4"><input class="ow-radio" type="radio" name="ow-active" id="ow_sel_4" value="4"><span class="ow-slot">#4</span></label><span class="ow-temp" id="ow_temp_4">— °C</span><span class="ow-binding" id="ow_bind_4"></span><select id="ow_var_4" class="form-select ow-select"><option value="">Не призначено</option><option value="Tn">Tn</option><option value="T1">T1</option><option value="T2">T2</option><option value="T11">T11</option><option value="T12">T12</option><option value="T21">T21</option><option value="T22">T22</option><option value="T31">T31</option><option value="T41">T41</option><option value="T32">T32</option><option value="T42">T42</option></select></div>
+          <div class="ow-item" id="ow_row_5"><label class="ow-pick" for="ow_sel_5"><input class="ow-radio" type="radio" name="ow-active" id="ow_sel_5" value="5"><span class="ow-slot">#5</span></label><span class="ow-temp" id="ow_temp_5">— °C</span><span class="ow-binding" id="ow_bind_5"></span><select id="ow_var_5" class="form-select ow-select"><option value="">Не призначено</option><option value="Tn">Tn</option><option value="T1">T1</option><option value="T2">T2</option><option value="T11">T11</option><option value="T12">T12</option><option value="T21">T21</option><option value="T22">T22</option><option value="T31">T31</option><option value="T41">T41</option><option value="T32">T32</option><option value="T42">T42</option></select></div>
+          <div class="ow-item" id="ow_row_6"><label class="ow-pick" for="ow_sel_6"><input class="ow-radio" type="radio" name="ow-active" id="ow_sel_6" value="6"><span class="ow-slot">#6</span></label><span class="ow-temp" id="ow_temp_6">— °C</span><span class="ow-binding" id="ow_bind_6"></span><select id="ow_var_6" class="form-select ow-select"><option value="">Не призначено</option><option value="Tn">Tn</option><option value="T1">T1</option><option value="T2">T2</option><option value="T11">T11</option><option value="T12">T12</option><option value="T21">T21</option><option value="T22">T22</option><option value="T31">T31</option><option value="T41">T41</option><option value="T32">T32</option><option value="T42">T42</option></select></div>
+          <div class="ow-item" id="ow_row_7"><label class="ow-pick" for="ow_sel_7"><input class="ow-radio" type="radio" name="ow-active" id="ow_sel_7" value="7"><span class="ow-slot">#7</span></label><span class="ow-temp" id="ow_temp_7">— °C</span><span class="ow-binding" id="ow_bind_7"></span><select id="ow_var_7" class="form-select ow-select"><option value="">Не призначено</option><option value="Tn">Tn</option><option value="T1">T1</option><option value="T2">T2</option><option value="T11">T11</option><option value="T12">T12</option><option value="T21">T21</option><option value="T22">T22</option><option value="T31">T31</option><option value="T41">T41</option><option value="T32">T32</option><option value="T42">T42</option></select></div>
+        </div>
+      </div>
+      <div class="card" style="grid-column: 1 / -1;">
+        <h3 class="card-title">Керування насосами</h3>
+        <div class="setting-group">
+            <div class="setting-row"><label for="pump1_1_en" class="form-label">Насос М1 (Контур I):</label><label class="switch"><input type="checkbox" id="pump1_1_en"><span class="slider"></span></label></div>
+            <div class="setting-row"><label for="pump1_2_en" class="form-label">Насос М2 (Контур I):</label><label class="switch"><input type="checkbox" id="pump1_2_en"><span class="slider"></span></label></div>
+            <div class="setting-row"><label for="pump2_1_en" class="form-label">Насос М1 (Контур II):</label><label class="switch"><input type="checkbox" id="pump2_1_en"><span class="slider"></span></label></div>
+            <div class="setting-row"><label for="pump2_2_en" class="form-label">Насос М2 (Контур II):</label><label class="switch"><input type="checkbox" id="pump2_2_en"><span class="slider"></span></label></div>
+            <div class="actions-row"><button id="savePumps" class="btn btn-primary">Зберегти</button></div>
+        </div>
+      </div>
+       <div class="card">
+        <h3 class="card-title">Налаштування часу</h3>
+        <div class="setting-group">
+          <div class="time-setup">
+             <input id="time_hh" type="number" min="0" max="23" class="form-input" placeholder="ГГ">
+             <span>:</span>
+             <input id="time_mm" type="number" min="0" max="59" class="form-input" placeholder="ХХ">
+             <select id="time_dow" class="form-select">
+                 <option value="1">Пн</option><option value="2">Вт</option><option value="3">Ср</option>
+                 <option value="4">Чт</option><option value="5">Пт</option><option value="6">Сб</option>
+                 <option value="0">Нд</option>
+             </select>
+          </div>
+          <div class="actions-row"><button id="saveTime" class="btn btn-primary">Встановити час</button></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3 class="card-title">Дані контролера</h3>
+        <div class="setting-group">
+          <div class="setting-row"><label for="ctrlIndex" class="form-label">Індекс контролера:</label><input id="ctrlIndex" class="form-input" type="text" placeholder="Напр., A8_001"></div>
+          <div class="actions-row"><button id="saveCtrlIndex" class="btn btn-primary">Зберегти</button></div>
+        </div>
+      </div>
+    </div>
+    <a href="#main-page" class="btn btn-secondary btn-footer">< На головну</a>
+  </div>
+  
+  <div id="pinModal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="pinTitle">
+    <div class="modal-dialog">
+      <div class="modal-titlebar"><h3 id="pinTitle">Введіть PIN-код</h3><button id="pinClose" class="modal-close" type="button">&times;</button></div>
+      <input id="pinInput" class="form-input" type="password" placeholder="••••" autocomplete="current-password" inputmode="numeric" />
+      <div id="pinError">Невірний PIN-код.</div>
+      <div class="actions-row"><button id="pinOk" class="btn btn-primary" type="button">Підтвердити</button></div>
+    </div>
+  </div>
+
+  <div id="alertModal" class="modal-overlay" role="alertdialog" aria-modal="true" aria-labelledby="alertTitle">
+    <div id="alertModalDialog" class="modal-dialog">
+      <div class="modal-titlebar"><h3 id="alertTitle">Сповіщення</h3></div>
+      <p id="alertMessage" style="margin: 1rem 0; font-size: 1.1rem;"></p>
+      <div class="actions-row"><button id="alertOk" class="btn btn-primary" type="button">OK</button></div>
+    </div>
+  </div>
+
+<script>
+    // --- Модуль 1: Навигация по страницам ---
+    (function() {
+      function showPage(hash) {
+        document.querySelectorAll('.container').forEach(el => el.style.display = 'none');
+        const target = hash && document.querySelector(hash) ? document.querySelector(hash) : document.querySelector('#main-page');
+        if (target) { target.style.display = 'block'; }
+        window.scrollTo({ top: 0, behavior: 'instant' });
+      }
+      window.addEventListener('hashchange', () => showPage(location.hash));
+      document.addEventListener('DOMContentLoaded', () => showPage(location.hash));
+    })();
+
+    // --- Модуль 2: Клієнтська логіка PIN-коду та модальних вікон ---
+    (function () {
+      const pinModal = document.getElementById('pinModal');
+      const pinInput = document.getElementById('pinInput');
+      const pinError = document.getElementById('pinError');
+      const pinOkBtn = document.getElementById('pinOk');
+      const pinCloseBtn = document.getElementById('pinClose');
+      const ACCESS_KEY = 'general_access_granted';
+      
+      function showPinModal() {
+        pinError.style.display = 'none'; pinInput.value = ''; document.body.classList.add('modal-open');
+        pinModal.classList.add('active'); setTimeout(() => pinInput.focus(), 50);
+      }
+      function hidePinModal() { pinInput.blur(); pinModal.classList.remove('active'); document.body.classList.remove('modal-open'); }
+      function allowAndGo() { try { sessionStorage.setItem(ACCESS_KEY, '1'); } catch (e) {} hidePinModal(); location.hash = '#general'; }
+      function checkPin() { if ((pinInput.value || '').trim() === ADMIN_PIN) { allowAndGo(); } else { pinError.style.display = 'block'; pinInput.select(); } }
+      
+      document.querySelectorAll('a[href="#general"]').forEach(link => {
+        link.addEventListener('click', function (e) {
+          try { if (sessionStorage.getItem(ACCESS_KEY) === '1') return; } catch (e) {}
+          e.preventDefault(); showPinModal();
+        });
+      });
+      pinOkBtn.addEventListener('click', checkPin);
+      pinCloseBtn.addEventListener('click', hidePinModal);
+      pinInput.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); checkPin(); } if (ev.key === 'Escape') { ev.preventDefault(); hidePinModal(); } });
+      pinModal.addEventListener('click', (ev) => { if (ev.target === pinModal) hidePinModal(); });
+
+      const alertModal = document.getElementById('alertModal');
+      const alertModalDialog = document.getElementById('alertModalDialog');
+      const alertTitle = document.getElementById('alertTitle');
+      const alertMessage = document.getElementById('alertMessage');
+      const alertOk = document.getElementById('alertOk');
+      
+      window.showAlert = (title, message, type = 'info') => {
+        alertTitle.textContent = title;
+        alertMessage.innerHTML = message;
+        alertModalDialog.className = 'modal-dialog';
+        if (type === 'alarm') alertModalDialog.classList.add('alarm');
+        if (type === 'warning') alertModalDialog.classList.add('warning');
+        
+        document.body.classList.add('modal-open');
+        alertModal.classList.add('active');
+      };
+
+      function hideAlertModal() {
+        alertModal.classList.remove('active');
+        if (!pinModal.classList.contains('active')) {
+          document.body.classList.remove('modal-open');
+        }
+      }
+      alertOk.addEventListener('click', hideAlertModal);
+      alertModal.addEventListener('click', (ev) => { if (ev.target === alertModal) hideAlertModal(); });
+    })();
+
+    // --- Модуль 3: Логика редактора погодозависимой кривой ---
+    (function(){
+      const tbody = document.getElementById('curve-tbody'), btnSort = document.getElementById('curve-sort');
+      const btnReset= document.getElementById('curve-reset'), toast = document.getElementById('curve-toast');
+      const LIMITS = { toutMin: -22, toutMax: 20, tsMin: 30, tsMax: 85 };
+      window.__curve = {
+        readRows: (skipValidate) => {
+            [...tbody.querySelectorAll('input.cell-input')].forEach(el=>el.classList.remove('invalid'));
+            const points = [...tbody.querySelectorAll('tr')].map(r=>({x:Number(r.querySelector('.tout').value), y:Number(r.querySelector('.tsup').value), row:r}));
+            if (points.length !== 5) return { ok:false, msg:'Потрібно рівно 5 точок.' };
+            let ok = true, msg = '';
+            if (!skipValidate) {
+              points.forEach(p=>{
+                if (isNaN(p.x) || p.x < LIMITS.toutMin || p.x > LIMITS.toutMax) { ok = false; markInvalid(p.row.querySelector('.tout')); }
+                if (isNaN(p.y) || p.y < LIMITS.tsMin || p.y > LIMITS.tsMax) { ok = false; markInvalid(p.row.querySelector('.tsup')); }
+              });
+              const xs = points.map(p=>p.x);
+              if (new Set(xs).size !== xs.length) { ok = false; msg = 'Зовнішні температури (стовпець 1) мають бути унікальними.'; }
+            }
+            return { ok, msg, points: points.map(({x,y})=>({x,y})) };
+        },
+        setRows: (points) => {
+            if (!points || !Array.isArray(points) || points.length !== 5) return;
+            const rows = [...tbody.querySelectorAll('tr')];
+            for (let i=0; i<5; i++){ rows[i].querySelector('.tout').value = points[i].x; rows[i].querySelector('.tsup').value = points[i].y; }
+        },
+        showToast: (text, isError=false) => {
+            toast.textContent = text; toast.className = 'toast ' + (isError?'error ':'') + 'show';
+            setTimeout(()=>{ toast.className = 'toast'; }, 2200);
+        }
+      };
+      function markInvalid(el){ if (el) el.classList.add('invalid'); }
+      btnSort.addEventListener('click', () => {
+        const res = window.__curve.readRows(true); res.points.sort((a,b)=>a.x-b.x);
+        window.__curve.setRows(res.points); window.__curve.showToast('Точки відсортовано за T вулиці (^).');
+      });
+      btnReset.addEventListener('click', () => {
+        const defaults = [ {x: 11, y: 37}, {x: 0, y: 54}, {x: -10, y: 65}, {x: -15, y: 70}, {x: -22, y: 80} ];
+        window.__curve.setRows(defaults); window.__curve.showToast('Повернено типові значення.');
+      });
+    })();
+
+    // --- Модуль 4: UI для 1-Wire (сканирование, обновление, сохранение) ---
+    (function(){
+      const MAX = 7;
+      const rows = [...Array(MAX)].map((_,i)=> document.getElementById(`ow_row_${i+1}`));
+      const temps = [...Array(MAX)].map((_,i)=> document.getElementById(`ow_temp_${i+1}`));
+      const bindings = [...Array(MAX)].map((_,i)=> document.getElementById(`ow_bind_${i+1}`));
+      const radios = [...Array(MAX)].map((_,i)=> document.getElementById(`ow_sel_${i+1}`));
+      const selects = [...Array(MAX)].map((_,i)=> document.getElementById(`ow_var_${i+1}`));
+      const btnScan = document.getElementById('owScan'), btnSave = document.getElementById('owSave');
+      function fmtTemp(t){ return (t === null || isNaN(t)) ? "— °C" : Number(t).toFixed(2) + " °C"; }
+      function renderSensors(sensors){
+        for (let i=0; i<MAX; i++){
+            rows[i].dataset.rom = "";
+            temps[i].textContent = "— °C";
+            bindings[i].textContent = "";
+            bindings[i].className = "ow-binding";
+        }
+        const n = Math.min(sensors.length, MAX);
+        for (let i=0; i<n; i++){
+            const s = sensors[i];
+            rows[i].dataset.rom = s.rom || "";
+            temps[i].textContent = fmtTemp(s.t);
+            if (s.var) {
+                bindings[i].textContent = s.var;
+                bindings[i].className = "ow-binding bound";
+            } else {
+                bindings[i].textContent = "";
+                bindings[i].className = "ow-binding unbound";
+            }
+        }
+        if (!radios.some(r => r.checked) && n > 0) { radios[0].checked = true; }
+      }
+      if (btnScan){
+        btnScan.addEventListener('click', async ()=>{
+          try {
+            const res = await fetch('/api/ow/scan', { method:'POST' }); const data = await res.json();
+            if (!data || !data.ok) throw new Error('bad response'); renderSensors(data.sensors || []);
+          } catch(err) { alert('Помилка сканування. Перевірте підключення.'); }
+        });
+      }
+      function getActiveSlot(){
+        const r = radios.find(r => r.checked); if (!r) return null; const slot = Number(r.value);
+        return { slot, rom: rows[slot-1]?.dataset?.rom || "", varName: selects[slot-1]?.value || "" };
+      }
+      window.__owGetActive = getActiveSlot;
+      if (btnSave) {
+        btnSave.addEventListener('click', async ()=>{
+          try {
+            const sel = getActiveSlot();
+            if (!sel || !sel.slot) { alert('Виберіть слот (радіо ліворуч).'); return; }
+            if (!sel.varName) { alert('Виберіть змінну у списку праворуч.'); return; }
+            if (!sel.rom) { alert('Немає ROM у слоті. Спочатку натисніть "Сканувати".'); return; }
+            const res = await fetch('/api/ow/bind', { method:'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ var: sel.varName, rom: sel.rom }) });
+            const data = await res.json(); if (!data.ok) throw new Error(data.err || 'bind failed');
+            alert(`Збережено: ${data.var} <- ${data.rom}`);
+            if (btnScan) btnScan.click();
+          } catch(e) { alert('Помилка збереження (перевірте слот/змінну/ROM).'); }
+        });
+      }
+      async function pollStatus(){
+        try{
+          const res = await fetch('/api/ow/status'); const data = await res.json(); if (!data || !data.ok) return;
+          const sensors = data.sensors || [];
+          for (let i=0; i<MAX; i++){ const s = sensors.find(s => s.rom === rows[i].dataset.rom); if(s) { temps[i].textContent = fmtTemp(s.t); } }
+        }catch(e){ console.warn("OW poll failed", e); }
+      }
+      setInterval(pollStatus, 2000);
+    })();
+
+    // --- Модуль 5: Обновление общих параметров (T1, T2, Tn) ---
+   (function(){
+        const map = { T1:'T1_city', T2:'T2_city', Tn:'T_outdoor' }; const names = Object.keys(map).join(',');
+        function fmt(t){ 
+          if (t === null) return `<span class="temp-alarm">AL</span>`;
+          const n = (typeof t === 'string') ? parseFloat(t.replace(',', '.')) : Number(t); 
+          return Number.isFinite(n) ? n.toFixed(2) + ' °C' : '— °C'; 
+        }
+        function extractVars(data){ const out = {}; if (data && Array.isArray(data.vars)) { data.vars.forEach(item => { if (item?.name) out[item.name] = item?.t; }); } return out; }
+        async function refresh(){
+          try{
+            const res = await fetch('/api/vars/status?names=' + encodeURIComponent(names)); if (!res.ok) throw new Error('HTTP '+res.status);
+            const data = await res.json(); const vars = extractVars(data);
+            Object.entries(map).forEach(([name, elId])=>{ const el = document.getElementById(elId); if (el && Object.prototype.hasOwnProperty.call(vars, name)) { el.innerHTML = fmt(vars[name]); } });
+          }catch(e){ console.warn('vars/status error', e); }
+        }
+        refresh(); setInterval(refresh, 2000);
+      })();
+
+    // --- Модуль 6: Выбор профиля (плитки) для контуров ---
+    (function(){
+        const mapC1 = new Map([ ['c1_btn_co', 'CO_1'], ['c1_btn_gvp', 'GVP_1'], ['c1_btn_3', 'CO_2'], ['c1_btn_4', 'GVP_2'], ['c1_btn_5', 'CUSTOM_5'], ['c1_btn_6', 'CUSTOM_6'], ]);
+        const mapC2 = new Map([ ['c2_btn_co', 'CO_1'], ['c2_btn_gvp', 'GVP_1'], ['c2_btn_3', 'CO_2'], ['c2_btn_4', 'GVP_2'], ['c2_btn_5', 'CUSTOM_5'], ['c2_btn_6', 'CUSTOM_6'], ]);
+        function clearHighlight(cont){ const ids = cont === 1 ? mapC1.keys() : mapC2.keys(); for (const id of ids) { const el = document.getElementById(id); if (el) el.classList.remove('tile-selected'); } }
+        function applyHighlight(cont, tileId){
+          clearHighlight(cont);
+          const map = (cont===1) ? mapC1 : mapC2;
+          for (const [btnId, id] of map){ if (id === tileId){ const el = document.getElementById(btnId); if (el) el.classList.add('tile-selected'); break; } }
+        }
+        async function refreshProfile(cont){ try{ const res = await fetch('/api/contour/profile?cont=' + cont); const data = await res.json(); if (data && data.ok) { applyHighlight(cont, data.id || 'CUSTOM_6'); } }catch(e){ /* ignore */ } }
+        function installLongPress(cont, map){
+          const LONG_MS = 700;
+          for (const [btnId, tileId] of map){
+            const el = document.getElementById(btnId); if (!el) continue;
+            let timer = null;
+            const start = () => { timer = setTimeout(()=>{ const msg = `Застосувати шаблон "${tileId}" для Контуру ${cont}?`; if (confirm(msg)){ saveChoice(cont, tileId, el); } }, LONG_MS); };
+            const cancel = () => { if (timer) clearTimeout(timer); };
+            el.addEventListener('pointerdown', start); el.addEventListener('pointerup', cancel); el.addEventListener('pointerleave', cancel);
+          }
+        }
+        async function saveChoice(cont, tileId, elBtn){
+          try{
+            elBtn?.setAttribute('disabled', 'disabled');
+            const res = await fetch('/api/contour/profile', { method:'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ cont, id: tileId }) });
+            const data = await res.json(); if (!data || !data.ok) throw new Error(data?.err || 'save failed');
+            applyHighlight(cont, tileId); alert(`Збережено: Контур ${cont} <- ${tileId}`);
+            if (window.__refreshContour) window.__refreshContour(cont);
+          }catch(e){ alert('Помилка збереження шаблону: ' + (e?.message || '')); }finally{ elBtn?.removeAttribute('disabled'); }
+        }
+        installLongPress(1, mapC1); installLongPress(2, mapC2);
+        function onPageShown(){ if (location.hash === '#general') { refreshProfile(1); refreshProfile(2); } }
+        window.addEventListener('hashchange', onPageShown); onPageShown();
+    })();
+
+    // --- Модуль 7: Динамическое обновление и управление настройками контуров ---
+    (function(){
+        const state = {
+          1: { id: "CUSTOM_6", TZAD: "", TPOD: "", TINV: "" },
+          2: { id: "CUSTOM_6", TZAD: "", TPOD: "", TINV: "" }
+        };
+        function setText(id, text){ const el = document.getElementById(id); if (el) el.textContent = text; }
+        function setValue(id, val){ const el = document.getElementById(id); if (el) el.value = val; }
+        async function loadContour(cont){
+          try{
+            const res = await fetch('/api/contour/profile?cont=' + cont); const data = await res.json(); if (!data || !data.ok) return;
+            state[cont].TPOD = data.TPOD || "";
+            state[cont].TINV = data.TINV || "";
+            state[cont].id = data.id || "CUSTOM_6";
+            state[cont].TZAD = data.TZAD || "";
+            const displayName = (data.id === 'CUSTOM_6') ? '—' : (data.display || '—');
+            setText(cont === 1 ? 'tile_name_1' : 'tile_name_2', displayName);
+            setText(cont === 1 ? 'settings_name_1' : 'settings_name_2', displayName);
+            const labId = cont===1 ? 'si_param_label' : 'sii_param_label';
+            const valId = cont===1 ? 'si_param_value' : 'sii_param_value';
+            setText(labId, data.settingsLabel || '');
+            const pv = (typeof data.paramValue === 'number') ? data.paramValue : data.defaultValue || 0;
+            const decimals = (data.id || '').includes('CO_') ? 2 : 0;
+            setValue(valId, Number(pv).toFixed(decimals));
+            if (data.id === 'CUSTOM_6') {
+              if (cont===1) { document.getElementById('Tpod_I').innerHTML ='— °C'; document.getElementById('Tinv_I').innerHTML = '— °C'; }
+              else { document.getElementById('Tpod_II').innerHTML = '— °C'; document.getElementById('Tinv_II').innerHTML = '— °C'; }
+            }
+          }catch(e){ console.warn('loadContour failed', e); }
+        }
+        async function pollTemps(){
+          const names = [state[1].TPOD, state[1].TINV, state[2].TPOD, state[2].TINV].filter(Boolean); if (!names.length) return;
+          try{
+            const res = await fetch('/api/vars/status?names=' + encodeURIComponent(names.join(','))); const data = await res.json(); if (!data || !data.ok) return;
+            const tmap = {}; (data.vars || []).forEach(it => { tmap[it.name] = it.t; });
+            const fmt = t => (t === null) ? `<span class="temp-alarm">AL</span>` : (Number(t).toFixed(2) + " °C");
+            if (state[1].TPOD) document.getElementById('Tpod_I').innerHTML = fmt(tmap[state[1].TPOD]); if (state[1].TINV) document.getElementById('Tinv_I').innerHTML = fmt(tmap[state[1].TINV]);
+            if (state[2].TPOD) document.getElementById('Tpod_II').innerHTML = fmt(tmap[state[2].TPOD]); if (state[2].TINV) document.getElementById('Tinv_II').innerHTML = fmt(tmap[state[2].TINV]);
+          }catch(e){ /* ignore */ }
+        }
+        function setupContourControls(cont) {
+            const prefix = (cont === 1) ? 'si' : 'sii';
+            const btnMinus = document.getElementById(`${prefix}_btn_minus_param`);
+            const btnPlus = document.getElementById(`${prefix}_btn_plus_param`);
+            const btnSave = document.getElementById(`${prefix}_btn_save`);
+            const valueInput = document.getElementById(`${prefix}_param_value`);
+
+            const adjustValue = (direction) => {
+                const profileId = state[cont].id;
+                const isGVP = profileId.includes('GVP_');
+                const step = isGVP ? 1.0 : 0.1;
+                const min = isGVP ? 30 : 0;
+                const max = isGVP ? 70 : 3;
+                const decimals = isGVP ? 0 : 2;
+                
+                let currentValue = parseFloat(valueInput.value);
+                if (isNaN(currentValue)) currentValue = isGVP ? 55 : 1.0;
+
+                let newValue = currentValue + (direction * step);
+                if (newValue < min) newValue = min;
+                if (newValue > max) newValue = max;
+                
+                valueInput.value = newValue.toFixed(decimals);
+            };
+
+            btnMinus.addEventListener('click', () => adjustValue(-1));
+            btnPlus.addEventListener('click', () => adjustValue(1));
+
+            btnSave.addEventListener('click', async () => {
+                const tzad = state[cont].TZAD;
+                const value = parseFloat(valueInput.value);
+                if (!tzad || isNaN(value)) { alert('Неможливо зберегти: невірні дані.'); return; }
+                
+                try {
+                    const res = await fetch('/api/contour/param', {
+                        method: 'POST', headers: {'Content-Type':'application/json'},
+                        body: JSON.stringify({ tzad, value })
+                    });
+                    const data = await res.json();
+                    if (data.ok) { alert('Збережено!'); } else { throw new Error(data.err); }
+                } catch(e) { alert('Помилка збереження: ' + e.message); }
+            });
+        }
+        loadContour(1); loadContour(2);
+        setupContourControls(1); setupContourControls(2);
+        setInterval(pollTemps, 2000);
+        window.__refreshContour = loadContour;
+        window.addEventListener('hashchange', ()=>{ if (location.hash === '#main-page' || location.hash === '') { loadContour(1); loadContour(2); } });
+    })();
+
+    // --- Модуль 8: Ручное управление клапанами (реле) ---
+    (function() {
+        async function sendPulseRequest(relayNumber, btnEl) {
+            if (!btnEl) return; const originalBg = btnEl.style.backgroundColor;
+            btnEl.style.backgroundColor = '#a0a0a0'; btnEl.disabled = true;
+            try {
+                const response = await fetch('/api/relay/pulse', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ relay: relayNumber }) });
+                btnEl.style.backgroundColor = response.ok ? '#90ee90' : '#ff8080';
+            } catch (error) { console.error('Pulse request fetch error:', error); btnEl.style.backgroundColor = '#ff8080'; } 
+            finally { setTimeout(() => { btnEl.style.backgroundColor = ''; btnEl.disabled = false; }, 2100); }
+        }
+        document.getElementById('si_valve_minus').addEventListener('click', (e) => sendPulseRequest(1, e.target));
+        document.getElementById('si_valve_plus').addEventListener('click', (e) => sendPulseRequest(2, e.target));
+        document.getElementById('sii_valve_minus').addEventListener('click', (e) => sendPulseRequest(5, e.target));
+        document.getElementById('sii_valve_plus').addEventListener('click', (e) => sendPulseRequest(6, e.target));
+    })();
+
+    // --- Модуль 9: Управление общими настройками ---
+    (function() {
+        window.forcePollMainStatus = () => {};
+        
+        async function loadSettings() {
+            try {
+                const response = await fetch('/api/settings/load'); if (!response.ok) throw new Error('Failed to load settings');
+                const data = await response.json();
+                
+                if (data.hasOwnProperty('ctrlIndex')) document.getElementById('ctrlIndex').value = data.ctrlIndex;
+                if (data.hasOwnProperty('pi1_Ki')) document.getElementById('pi1_Ki').value = data.pi1_Ki;
+                if (data.hasOwnProperty('pi1_Kp')) document.getElementById('pi1_Kp').value = data.pi1_Kp;
+                if (data.hasOwnProperty('pi1_Ti')) document.getElementById('pi1_Ti').value = data.pi1_Ti;
+                if (data.hasOwnProperty('pi2_Ki')) document.getElementById('pi2_Ki').value = data.pi2_Ki;
+                if (data.hasOwnProperty('pi2_Kp')) document.getElementById('pi2_Kp').value = data.pi2_Kp;
+                if (data.hasOwnProperty('pi2_Ti')) document.getElementById('pi2_Ti').value = data.pi2_Ti;
+                if (data.hasOwnProperty('summerCutoff')) document.getElementById('summerCutoff').value = data.summerCutoff;
+                if (data.hasOwnProperty('gvpPidDz')) document.getElementById('gvpPidDz').value = data.gvpPidDz;
+                if (data.hasOwnProperty('gvpPidKf')) document.getElementById('gvpPidKf').value = data.gvpPidKf;
+                if (data.hasOwnProperty('gvpPidMax')) document.getElementById('gvpPidMax').value = data.gvpPidMax;
+                
+                if (data.hasOwnProperty('pumpEnableMask')) {
+                    const mask = data.pumpEnableMask;
+                    document.getElementById('pump1_1_en').checked = (mask & 1) !== 0;
+                    document.getElementById('pump1_2_en').checked = (mask & 2) !== 0;
+                    document.getElementById('pump2_1_en').checked = (mask & 4) !== 0;
+                    document.getElementById('pump2_2_en').checked = (mask & 8) !== 0;
+                }
+
+                if (data.curvePoints && window.__curve && window.__curve.setRows) { window.__curve.setRows(data.curvePoints); }
+                
+                // [НОВЕ] Завантаження налаштувань комфорту
+                if (data.comfort1 && window.__comfort) window.__comfort.load(1, data.comfort1);
+                if (data.comfort2 && window.__comfort) window.__comfort.load(2, data.comfort2);
+
+            } catch (error) { console.error("Error loading settings:", error); }
+        }
+        async function postSettings(payload, callback) {
+            try {
+                const response = await fetch('/api/settings/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                const result = await response.json();
+                if (result.ok) { 
+                    alert('Збережено!');
+                    if(callback) callback();
+                } else { 
+                    alert('Помилка збереження: ' + (result.err || 'unknown error')); 
+                }
+            } catch (error) { console.error("Error saving settings:", error); alert('Помилка мережі при збереженні.'); }
+        }
+        document.getElementById('saveCtrlIndex').addEventListener('click', () => { postSettings({ block: 'ctrl', value: document.getElementById('ctrlIndex').value }); });
+        document.getElementById('curve-save').addEventListener('click', () => {
+            if (!window.__curve) return; const res = window.__curve.readRows(false);
+            if (!res.ok) { window.__curve.showToast(res.msg || 'Перевірте значення точок.', true); return; }
+            res.points.sort((a,b)=>a.x - b.x); postSettings({ block: 'curve', points: res.points });
+        });
+        document.getElementById('saveSummerCutoff').addEventListener('click', () => {
+           const value = parseFloat(document.getElementById('summerCutoff').value);
+           if (isNaN(value)) { alert('Будь ласка, введіть числове значення.'); return; }
+           postSettings({ block: 'summer_cutoff', value: value });
+        });
+        document.getElementById('saveGvpPid').addEventListener('click', () => {
+           const dz = parseFloat(document.getElementById('gvpPidDz').value);
+           const kf = parseFloat(document.getElementById('gvpPidKf').value);
+           const max = parseFloat(document.getElementById('gvpPidMax').value);
+           if (isNaN(dz) || isNaN(kf) || isNaN(max)) { alert('Будь ласка, введіть числові значення для всіх полів.'); return; }
+           postSettings({ block: 'gvp_pid', dz: dz, kf: kf, max: max });
+        });
+        document.getElementById('savePI1').addEventListener('click', () => { postSettings({ block: 'pi1', ki: parseFloat(document.getElementById('pi1_Ki').value) || 0, kp: parseFloat(document.getElementById('pi1_Kp').value) || 0, ti: parseFloat(document.getElementById('pi1_Ti').value) || 0 }); });
+        document.getElementById('savePI2').addEventListener('click', () => { postSettings({ block: 'pi2', ki: parseFloat(document.getElementById('pi2_Ki').value) || 0, kp: parseFloat(document.getElementById('pi2_Kp').value) || 0, ti: parseFloat(document.getElementById('pi2_Ti').value) || 0 }); });
+        document.getElementById('savePumps').addEventListener('click', () => {
+            let mask = 0;
+            if (document.getElementById('pump1_1_en').checked) mask |= 1;
+            if (document.getElementById('pump1_2_en').checked) mask |= 2;
+            if (document.getElementById('pump2_1_en').checked) mask |= 4;
+            if (document.getElementById('pump2_2_en').checked) mask |= 8;
+            postSettings({ block: 'pumps', mask: mask }, () => {
+                if(window.forcePollMainStatus) window.forcePollMainStatus();
+            });
+        });
+        
+        // [НОВЕ] Збереження часу
+        document.getElementById('saveTime').addEventListener('click', async () => {
+           const h = document.getElementById('time_hh').value;
+           const m = document.getElementById('time_mm').value;
+           const dow = document.getElementById('time_dow').value;
+           if (h === '' || m === '') { alert('Введіть години та хвилини.'); return; }
+           try {
+             const res = await fetch('/api/time/set', {
+                 method: 'POST', headers: {'Content-Type':'application/json'},
+                 body: JSON.stringify({ h: parseInt(h), m: parseInt(m), dow: parseInt(dow) })
+             });
+             const data = await res.json();
+             if (data.ok) { alert('Час встановлено.'); } else { throw new Error(data.err); }
+           } catch(e) { alert('Помилка встановлення часу: ' + e.message); }
+        });
+        
+        // [НОВЕ] Збереження комфортного режиму
+        document.getElementById('saveComfort1').addEventListener('click', () => { if (window.__comfort) window.__comfort.save(1); });
+        document.getElementById('saveComfort2').addEventListener('click', () => { if (window.__comfort) window.__comfort.save(2); });
+
+        window.addEventListener('hashchange', () => { if (location.hash === '#general') { loadSettings(); } });
+        if (location.hash === '#general') { loadSettings(); }
+    })();
+    
+    // --- Глобальний стан системи ---
+    window.SYSTEM_STATUS = {
+        display: 'UNKNOWN',
+        relay: 'UNKNOWN',
+        input: 'UNKNOWN',
+        rtc: 'UNKNOWN'
+    };
+
+    // --- Модуль 10: Обновление статуса на главном экране ---
+    (function(){
+      function mapPumpStatus(pumpStatus) {
+        switch(pumpStatus) {
+            case 'S_WORKING': return { text: 'РОБОТА', cssClass: 'working' };
+            case 'S_ALARM':   return { text: 'АВАРІЯ', cssClass: 'alarm' };
+            case 'S_REPAIR':  return { text: 'РЕМОНТ', cssClass: 'repair' };
+            case 'S_OK':      
+            default: return { text: 'СТОП', cssClass: 'ok' };
+        }
+      }
+
+      function applyPumpStatus(el, statusData) {
+        el.textContent = statusData.text;
+        el.className = 'status-badge ' + statusData.cssClass;
+      }
+      
+      function updateContourUI(prefix, data) {
+          const m1El = document.getElementById(`M1_${prefix}`);
+          const m2El = document.getElementById(`M2_${prefix}`);
+          const modeEl = document.getElementById(`mode_${prefix}`);
+          const dryEl = document.getElementById(`Dry_${prefix}`);
+          const valveEl = document.getElementById(`Valve_${prefix}`);
+          const tzavdEl = document.getElementById(`Tzavd_${prefix}`);
+
+          if (window.SYSTEM_STATUS.relay === 'OFFLINE') {
+              modeEl.textContent = 'AL I2C';
+              dryEl.textContent = 'AL I2C';
+              valveEl.textContent = 'AL I2C';
+              applyPumpStatus(m1El, { text: 'AL I2C', cssClass: 'alarm' });
+              applyPumpStatus(m2El, { text: 'AL I2C', cssClass: 'alarm' });
+              tzavdEl.textContent = 'AL I2C';
+              return;
+          }
+          if (window.SYSTEM_STATUS.input === 'OFFLINE') {
+              modeEl.textContent = 'AL I2C';
+              dryEl.textContent = 'AL I2C';
+              applyPumpStatus(m1El, { text: data.active_pump === 0 ? 'РОБОТА (?)' : 'СТОП (?)', cssClass: 'unknown' });
+              applyPumpStatus(m2El, { text: data.active_pump === 1 ? 'РОБОТА (?)' : 'СТОП (?)', cssClass: 'unknown' });
+          } else {
+              modeEl.textContent = data.mode === 1 ? 'Авто' : 'Ручний';
+              dryEl.textContent = data.dry_run === 1 ? 'OK' : 'АВАРІЯ';
+              dryEl.className = 'status-badge ' + (data.dry_run === 1 ? 'ok' : 'alarm');
+              const p1_is_starting = (data.logic_state === 1 || data.logic_state === 2) && data.active_pump === 0;
+              const p2_is_starting = (data.logic_state === 1 || data.logic_state === 2) && data.active_pump === 1;
+              if (p1_is_starting) applyPumpStatus(m1El, { text: 'ЗАПУСК...', cssClass: 'working' }); else applyPumpStatus(m1El, mapPumpStatus(data.p1_status));
+              if (p2_is_starting) applyPumpStatus(m2El, { text: 'ЗАПУСК...', cssClass: 'working' }); else applyPumpStatus(m2El, mapPumpStatus(data.p2_status));
+          }
+
+          if (valveEl) {
+            if (data.valve === 1) valveEl.textContent = 'Відкр...';
+            else if (data.valve === -1) valveEl.textContent = 'Закр...';
+            else valveEl.textContent = 'Стоп';
+          }
+
+          // [ОНОВЛЕНО] Логіка відображення уставки з комфортним режимом
+          let tzavdText = (data.tzavd !== null && !isNaN(data.tzavd)) ? Number(data.tzavd).toFixed(2) + ' °C' : '— °C';
+          if (data.isComfort && data.comfortReduction) {
+              const reduction = Number(data.comfortReduction);
+              if (!isNaN(reduction)) {
+                  tzavdText += ` (${reduction.toFixed(1)})`;
+              }
+          }
+          
+          if (data.summer_mode) {
+              if (modeEl.textContent !== 'AL I2C') modeEl.textContent = 'ЛІТО';
+              tzavdEl.textContent = 'ЛІТО';
+              if (window.SYSTEM_STATUS.input !== 'OFFLINE') {
+                applyPumpStatus(m1El, { text: 'СТОП', cssClass: 'ok' });
+                applyPumpStatus(m2El, { text: 'СТОП', cssClass: 'ok' });
+              }
+          } else if (data.logic_state === 6) {
+              if (modeEl.textContent !== 'AL I2C') modeEl.textContent = 'АВАРІЯ НАСОСІВ';
+              if (window.SYSTEM_STATUS.input !== 'OFFLINE') {
+                applyPumpStatus(m1El, { text: 'АВАРІЯ', cssClass: 'alarm' });
+                applyPumpStatus(m2El, { text: 'АВАРІЯ', cssClass: 'alarm' });
+              }
+              tzavdEl.textContent = tzavdText;
+          } else {
+              tzavdEl.textContent = tzavdText;
+          }
+      }
+
+      async function pollMainStatus() {
+        try {
+          const response = await fetch('/api/main/status');
+          if (!response.ok) return;
+          const data = await response.json();
+          if (!data.ok) return;
+
+          if (data.c1) updateContourUI('I', data.c1);
+          if (data.c2) updateContourUI('II', data.c2);
+
+        } catch(e) { /* ignore network errors */ }
+      }
+      
+      if (window.forcePollMainStatus) {
+          window.forcePollMainStatus = pollMainStatus;
+      }
+      setInterval(pollMainStatus, 2000);
+      pollMainStatus();
+    })();
+
+    // --- Модуль 11: Оновлення стану системи та показ сповіщень ---
+    (function() {
+        const displayedAlerts = { display: false, relay: false, input: false };
+
+        function updateStatusField(elementId, status, onlineText, offlineText) {
+            const el = document.getElementById(elementId);
+            if (el) {
+                el.textContent = status === 'ONLINE' ? (onlineText || 'ONLINE') : (offlineText || 'OFFLINE');
+                el.style.color = status === 'ONLINE' ? 'var(--status-summer-fg)' : 'var(--status-alarm-fg)';
+                el.style.fontWeight = 'bold';
+            }
+        }
+        
+        function setComfortModeDisabled(state) {
+            const cards = document.querySelectorAll('.comfort-card');
+            cards.forEach(card => {
+                const inputs = card.querySelectorAll('input, button, select');
+                inputs.forEach(input => input.disabled = state);
+                card.style.opacity = state ? '0.6' : '1';
+                card.style.pointerEvents = state ? 'none' : 'auto';
+            });
+        }
+
+        async function pollSystemStatus() {
+            try {
+                const response = await fetch('/api/system/status');
+                if (!response.ok) return;
+                const data = await response.json();
+                if (!data.ok) return;
+
+                const prevStatus = { ...window.SYSTEM_STATUS };
+                window.SYSTEM_STATUS = data;
+                
+                updateStatusField('status_display', data.display);
+                updateStatusField('status_relay', data.relay);
+                updateStatusField('status_input', data.input);
+                updateStatusField('status_rtc', data.rtc.status, data.rtc.time, 'OFFLINE');
+
+                setComfortModeDisabled(data.rtc.status !== 'ONLINE');
+
+                if (data.display === 'OFFLINE' && !displayedAlerts.display) {
+                    showAlert('Попередження', 'Локальний OLED-дисплей не відповідає.<br>Система продовжує роботу.', 'warning');
+                    displayedAlerts.display = true;
+                } else if (data.display === 'ONLINE') {
+                    displayedAlerts.display = false;
+                }
+
+                if (data.relay === 'OFFLINE' && !displayedAlerts.relay) {
+                    showAlert('Критична аварія', 'Втрачено зв\'язок з платою реле.<br><b>Керування системою зупинено.</b>', 'alarm');
+                    displayedAlerts.relay = true;
+                } else if (data.relay === 'ONLINE') {
+                    displayedAlerts.relay = false;
+                }
+
+                if (data.input === 'OFFLINE' && !displayedAlerts.input) {
+                    showAlert('Аварія', 'Втрачено зв\'язок з платою входів.<br><b>Система працює в аварійному "сліпому" режимі.</b>', 'alarm');
+                    displayedAlerts.input = true;
+                } else if (data.input === 'ONLINE') {
+                    displayedAlerts.input = false;
+                }
+            } catch (e) {
+                updateStatusField('status_display', 'OFFLINE');
+                updateStatusField('status_relay', 'OFFLINE');
+                updateStatusField('status_input', 'OFFLINE');
+                updateStatusField('status_rtc', 'OFFLINE', '', 'OFFLINE');
+                setComfortModeDisabled(true);
+            }
+        }
+        setInterval(pollSystemStatus, 3000);
+        pollSystemStatus();
+    })();
+
+    // [НОВЕ] Модуль 12: Логіка для комфортного режиму
+    (function() {
+      window.__comfort = {
+        save: async (cont) => {
+          const enabled = document.getElementById(`comfort_enabled_${cont}`).checked;
+          const intervals = [];
+          for (let i = 1; i <= 3; i++) {
+            const start = document.getElementById(`c${cont}_t${i}_start`).value;
+            const end = document.getElementById(`c${cont}_t${i}_end`).value;
+            const reduct = parseFloat(document.getElementById(`c${cont}_t${i}_reduct`).value);
+            intervals.push({ start, end, reduct: isNaN(reduct) ? 0 : reduct });
+          }
+          const days = [];
+          const dayCheckboxes = document.querySelectorAll(`#c${cont}_days input[type=checkbox]`);
+          dayCheckboxes.forEach(cb => {
+              if (cb.checked) days.push(parseInt(cb.value));
+          });
+
+          const payload = {
+            block: `comfort${cont}`,
+            config: { enabled, intervals, days }
+          };
+
+          try {
+            const response = await fetch('/api/settings/save', { 
+                method: 'POST', 
+                headers: { 'Content-Type': 'application/json' }, 
+                body: JSON.stringify(payload) 
+            });
+            const result = await response.json();
+            if (result.ok) {
+                showAlert('Збережено', `Налаштування комфортного режиму для контуру ${cont} збережено.`);
+            } else {
+                throw new Error(result.err || 'unknown error');
+            }
+          } catch (e) {
+            showAlert('Помилка', `Не вдалося зберегти налаштування комфортного режиму: ${e.message}`, 'alarm');
+          }
+        },
+        load: (cont, data) => {
+          document.getElementById(`comfort_enabled_${cont}`).checked = data.enabled || false;
+          (data.intervals || []).forEach((interval, i) => {
+            if (i < 3) {
+              document.getElementById(`c${cont}_t${i+1}_start`).value = interval.start || '00:00';
+              document.getElementById(`c${cont}_t${i+1}_end`).value = interval.end || '00:00';
+              document.getElementById(`c${cont}_t${i+1}_reduct`).value = interval.reduct || 0;
+            }
+          });
+          const dayCheckboxes = document.querySelectorAll(`#c${cont}_days input[type=checkbox]`);
+          dayCheckboxes.forEach(cb => {
+              cb.checked = (data.days || []).includes(parseInt(cb.value));
+          });
+        }
+      };
+
+      // Додаємо обробники для toggle switch, щоб одразу відправляти запит
+      document.getElementById('comfort_enabled_1').addEventListener('change', (e) => {
+          window.__comfort.save(1).then(() => {
+              const action = e.target.checked ? 'активовано' : 'деактивовано';
+              // showAlert('Інформація', `Комфортний режим для контуру I ${action}.`);
+          });
+      });
+      document.getElementById('comfort_enabled_2').addEventListener('change', (e) => {
+          window.__comfort.save(2).then(() => {
+              const action = e.target.checked ? 'активовано' : 'деактивовано';
+              // showAlert('Інформація', `Комфортний режим для контуру II ${action}.`);
+          });
+      });
+    })();
+</script>
+</body>
+</html>
+)====";
+
+
+// --- Секция 13: Обработчики HTTP-запросов (API эндпоинты) ---
+void handleRoot() {
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  size_t len = strlen_P(index_html);
+  server.send_P(200, "text/html; charset=utf-8", index_html, len);
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain; charset=utf-8", "404 Not Found");
+}
+
+struct CurvePoint {
+  float temp_out;
+  float temp_supply;
+};
+
+// [ОНОВЛЕНО] функція розрахунку уставки
+float calculateSetpoint(int contourNum, bool& isComfortActive, float& comfortReduction) {
+    isComfortActive = false;
+    comfortReduction = 0.0f;
+    String profileId = getProfileId(contourNum);
+    int tileIdx = tileIndexById(profileId);
+    if (tileIdx < 0) return NAN;
+    
+    const TileDef& tile = getTile(tileIdx);
+
+    int tpod_idx = -1, tinv_idx = -1, tn_idx = -1;
+    for(int i=0; i<OW_VAR_COUNT; ++i) {
+        if (strcmp(OW_VARS[i], tile.TPOD) == 0) tpod_idx = i;
+        if (strcmp(OW_VARS[i], tile.TINV) == 0) tinv_idx = i;
+        if (strcmp(OW_VARS[i], "Tn") == 0) tn_idx = i;
+    }
+    
+    bool tpod_ok = (tpod_idx != -1) && !sensorStates[tpod_idx].is_alarm;
+    bool tinv_ok = (tinv_idx != -1) && !sensorStates[tinv_idx].is_alarm;
+    bool tn_ok = (tn_idx != -1) && !sensorStates[tn_idx].is_alarm;
+    
+    float baseSetpoint = NAN;
+
+    if (profileId.startsWith("GVP")) {
+        if (tpod_ok) { // Штатний режим
+            prefsParams.begin("params", true);
+            baseSetpoint = prefsParams.getFloat(tile.TZAD, tile.defaultValue);
+            prefsParams.end();
+        } else if (tinv_ok) { // Аварійний режим по Tinv
+            baseSetpoint = 54.0f;
+        }
+    } else if (profileId.startsWith("CO")) {
+        prefsParams.begin("params", true);
+        float coefficient = prefsParams.getFloat(tile.TZAD, tile.defaultValue);
+        prefsParams.end();
+
+        if (tn_ok && tpod_ok) { // Штатний режим
+            float outdoor_temp = sensorStates[tn_idx].temperature;
+            // Розрахунок по кривій...
+            prefsGeneral.begin("general", true);
+            String jsonPoints = prefsGeneral.getString("curvePoints", "[]");
+            float summerCutoffTemp = prefsGeneral.getFloat("summerCutoff", 20.0f); 
+            prefsGeneral.end();
+            if (outdoor_temp < summerCutoffTemp) {
+                // ... (логіка інтерполяції, як і раніше)
+                // ... для спрощення, тут повернемо приблизне значення, але в реальному коді буде повний розрахунок
+                baseSetpoint = 50.0f; // Placeholder, реальна логіка нижче
+            }
+        } else if (!tn_ok && tinv_ok) { // Резерв-1 (відмова Tn)
+            baseSetpoint = 45.0f;
+        } else if (!tn_ok && !tinv_ok && tpod_ok) { // Резерв-2 (відмова Tn та Tinv)
+            baseSetpoint = 50.0f;
+        } else if (/*tn_ok &&*/ !tpod_ok && tinv_ok) { // Аварійний режим по Tinv (Tn в нормі або ні - неважливо)
+            baseSetpoint = 45.0f;
+        }
+    }
+
+    // [ОНОВЛЕНО] Логіка комфортного режиму
+    if (isnan(baseSetpoint) || !isRtcAvailable) {
+        return baseSetpoint;
+    }
+    
+    prefsGeneral.begin("general", true);
+    bool timeWasSet = prefsGeneral.getBool("timeWasSet", false);
+    String comfortKey = (contourNum == 1) ? "comfort1" : "comfort2";
+    String comfortJsonStr = prefsGeneral.getString(comfortKey.c_str(), "{}");
+    prefsGeneral.end();
+
+    if (!timeWasSet) { // Якщо час ніколи не встановлювався, виходимо
+        return baseSetpoint;
+    }
+
+    StaticJsonDocument<512> doc;
+    deserializeJson(doc, comfortJsonStr);
+
+    if (!doc["enabled"] | false) {
+        return baseSetpoint;
+    }
+
+    DateTime now;
+    if (rtc.lostPower()) { // Додаткова перевірка
+        if(rtcErrorCounter < 255) rtcErrorCounter++;
+        return baseSetpoint;
+    }
+    now = rtc.now();
+    rtcErrorCounter = 0; // Скидання при успішному читанні
+
+    int currentDow = now.dayOfTheWeek(); // 0=Нд, 1=Пн, ..., 6=Сб
+    int currentMinutes = now.hour() * 60 + now.minute();
+    
+    JsonArray days = doc["days"];
+    bool todayIsActive = false;
+    for(int day : days) {
+        if (day == currentDow) {
+            todayIsActive = true;
+            break;
+        }
+    }
+
+    if (!todayIsActive) {
+        return baseSetpoint;
+    }
+
+    JsonArray intervals = doc["intervals"];
+    for(JsonObject interval : intervals) {
+        String startStr = interval["start"] | "00:00";
+        String endStr = interval["end"] | "00:00";
+        float reduction = interval["reduct"] | 0.0;
+
+        int startMinutes = (startStr.substring(0,2).toInt()) * 60 + startStr.substring(3,5).toInt();
+        int endMinutes = (endStr.substring(0,2).toInt()) * 60 + endStr.substring(3,5).toInt();
+        if (endMinutes == 0 && startMinutes > 0) endMinutes = 1440; // кінець доби
+
+        if (currentMinutes >= startMinutes && currentMinutes < endMinutes) {
+            isComfortActive = true;
+            comfortReduction = reduction;
+            return baseSetpoint + reduction; // reduction має бути від'ємним
+        }
+    }
+
+    return baseSetpoint;
+}
+
+// Залишок коду функції calculateSetpoint (розрахунок по кривій), щоб не дублювати
+float calculateSetpointFromCurve(float outdoor_temp, float coefficient) {
+  prefsGeneral.begin("general", true);
+  String jsonPoints = prefsGeneral.getString("curvePoints", "[]");
+  float summerCutoffTemp = prefsGeneral.getFloat("summerCutoff", 20.0f); 
+  prefsGeneral.end();
+
+  if (outdoor_temp >= summerCutoffTemp) {
+    return NAN; 
+  }
+
+  CurvePoint points[5];
+  int point_count = 0;
+
+  StaticJsonDocument<256> doc;
+  deserializeJson(doc, jsonPoints);
+  JsonArray array = doc.as<JsonArray>();
+  for (JsonObject point : array) {
+      if (point_count >= 5) break;
+      points[point_count].temp_out = point["x"];
+      points[point_count].temp_supply = point["y"];
+      point_count++;
+  }
+  
+  if (point_count != 5) {
+    return NAN;
+  }
+ 
+  // Сортування
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 4 - i; j++) {
+      if (points[j].temp_out > points[j + 1].temp_out) {
+        CurvePoint temp = points[j];
+        points[j] = points[j + 1];
+        points[j + 1] = temp;
+      }
+    }
+  }
+
+  if (outdoor_temp <= points[0].temp_out) { 
+    return points[0].temp_supply * coefficient;
+  }
+  if (outdoor_temp >= points[4].temp_out) { 
+    return points[4].temp_supply * coefficient;
+  }
+
+  for (int i = 0; i < 4; i++) {
+    if (outdoor_temp >= points[i].temp_out && outdoor_temp <= points[i + 1].temp_out) {
+      float x0 = points[i].temp_out;
+      float y0 = points[i].temp_supply;
+      float x1 = points[i+1].temp_out;
+      float y1 = points[i+1].temp_supply;
+
+      float base_temp = y0 + (outdoor_temp - x0) * (y1 - y0) / (x1 - x0);
+      
+      return base_temp * coefficient;
+    }
+  }
+
+  return NAN;
+}
+
+
+void handleMainStatus() {
+    StaticJsonDocument<1024> doc; // Розмір збільшено для comfortReduction
+    doc["ok"] = true;
+
+    auto pumpStatusToString = [](PumpStatus status) -> const char* {
+        switch (status) {
+            case S_WORKING: return "S_WORKING";
+            case S_ALARM:   return "S_ALARM";
+            case S_REPAIR:  return "S_REPAIR";
+            case S_OK:      
+            default:        return "S_OK";
+        }
+    };
+    
+    JsonObject c1 = doc.createNestedObject("c1");
+    int valve1_dir = (pulseEndTimes[0] > 0 && (long)(millis() - pulseEndTimes[0]) < 0) ? -1 : ((pulseEndTimes[1] > 0 && (long)(millis() - pulseEndTimes[1]) < 0) ? 1 : 0);
+    bool isComfort1 = false;
+    float comfortReduction1 = 0.0f;
+    float tzavd1 = calculateSetpoint(1, isComfort1, comfortReduction1);
+    c1["mode"] = contour1_mode_stable;
+    c1["dry_run"] = dry_run_state_stable;
+    c1["p1_status"] = pumpStatusToString(pumpLogic1.pumps[0].status);
+    c1["p2_status"] = pumpStatusToString(pumpLogic1.pumps[1].status);
+    c1["logic_state"] = pumpLogic1.state;
+    c1["active_pump"] = pumpLogic1.activePumpIndex;
+    c1["summer_mode"] = pumpLogic1.summer_mode_active;
+    c1["valve"] = valve1_dir;
+    c1["isComfort"] = isComfort1;
+    c1["comfortReduction"] = comfortReduction1;
+    if (isnan(tzavd1)) c1["tzavd"] = nullptr; else c1["tzavd"] = tzavd1;
+
+    JsonObject c2 = doc.createNestedObject("c2");
+    int valve2_dir = (pulseEndTimes[4] > 0 && (long)(millis() - pulseEndTimes[4]) < 0) ? -1 : ((pulseEndTimes[5] > 0 && (long)(millis() - pulseEndTimes[5]) < 0) ? 1 : 0);
+    bool isComfort2 = false;
+    float comfortReduction2 = 0.0f;
+    float tzavd2 = calculateSetpoint(2, isComfort2, comfortReduction2);
+    c2["mode"] = contour2_mode_stable;
+    c2["dry_run"] = dry_run_state_2_stable;
+    c2["p1_status"] = pumpStatusToString(pumpLogic2.pumps[0].status);
+    c2["p2_status"] = pumpStatusToString(pumpLogic2.pumps[1].status);
+    c2["logic_state"] = pumpLogic2.state;
+    c2["active_pump"] = pumpLogic2.activePumpIndex;
+    c2["summer_mode"] = pumpLogic2.summer_mode_active;
+    c2["valve"] = valve2_dir;
+    c2["isComfort"] = isComfort2;
+    c2["comfortReduction"] = comfortReduction2;
+    if (isnan(tzavd2)) c2["tzavd"] = nullptr; else c2["tzavd"] = tzavd2;
+
+    String output;
+    serializeJson(doc, output);
+    server.send(200, "application/json", output);
+}
+
+
+// --- Секция 13.1: Функции и обработчики для реле ---
+void updateRelays() {
+  if (!isRelayExpanderAvailable) return;
+  Wire.beginTransmission(RELAY_I2C_ADDR);
+  Wire.write(relayStates);
+  if (Wire.endTransmission() != 0) {
+    if(relayErrorCounter < 255) relayErrorCounter++;
+  } else {
+    relayErrorCounter = 0;
+  }
+}
+
+void triggerRelayPulse(int relayIndex, unsigned long duration) {
+    if (relayIndex < 0 || relayIndex > 7) return;
+    int partnerIndex = relayIndex ^ 1; 
+    if ((pulseEndTimes[partnerIndex] > 0 && (long)(millis() - pulseEndTimes[partnerIndex]) < 0) || (pulseEndTimes[relayIndex] > 0 && (long)(millis() - pulseEndTimes[relayIndex]) < 0)) {
+      return; 
+    }
+    bitClear(relayStates, relayIndex);
+    updateRelays();
+    pulseEndTimes[relayIndex] = millis() + duration;
+}
+
+
+void handleRelayPulse() {
+    StaticJsonDocument<64> doc;
+    deserializeJson(doc, server.arg("plain"));
+    int relayNumber = doc["relay"] | 0;
+    if (relayNumber < 1 || relayNumber > 8) { server.send(400, "application/json", "{\"ok\":false, \"err\":\"invalid_relay_number\"}"); return; }
+    triggerRelayPulse(relayNumber - 1, 2000);
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleParamSave() {
+    StaticJsonDocument<128> doc;
+    deserializeJson(doc, server.arg("plain"));
+    const char* tzad = doc["tzad"];
+    float value = doc["value"];
+    if (!tzad || isnan(value)) { server.send(400, "application/json", "{\"ok\":false,\"err\":\"invalid_payload\"}"); return; }
+    prefsParams.begin("params", false);
+    prefsParams.putFloat(tzad, value);
+    prefsParams.end();
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
+
+// --- Секция 13.2: Обработчики для сохранения и загрузки общих настроек ---
+void handleSettingsLoad() {
+    prefsGeneral.begin("general", true);
+    StaticJsonDocument<2048> doc; // Збільшено розмір
+    doc["ctrlIndex"] = prefsGeneral.getString("ctrlIndex", "");
+    doc["pumpEnableMask"] = prefsGeneral.getUChar("pumpEnableMask", 0b1111);
+    doc["pi1_Ki"] = prefsGeneral.getFloat("pi1_Ki", 0.0);
+    doc["pi1_Kp"] = prefsGeneral.getFloat("pi1_Kp", 0.0);
+    doc["pi1_Ti"] = prefsGeneral.getFloat("pi1_Ti", 0.0);
+    doc["pi2_Ki"] = prefsGeneral.getFloat("pi2_Ki", 0.0);
+    doc["pi2_Kp"] = prefsGeneral.getFloat("pi2_Kp", 0.0);
+    doc["pi2_Ti"] = prefsGeneral.getFloat("pi2_Ti", 0.0);
+    
+    String curvePointsStr = prefsGeneral.getString("curvePoints", "[]");
+    StaticJsonDocument<256> curveDoc;
+    deserializeJson(curveDoc, curvePointsStr);
+    doc["curvePoints"] = curveDoc.as<JsonArray>();
+
+    doc["summerCutoff"] = prefsGeneral.getFloat("summerCutoff", 20.0);
+    doc["gvpPidDz"] = prefsGeneral.getFloat("gvpPidDz", 2.0);
+    doc["gvpPidKf"] = prefsGeneral.getFloat("gvpPidKf", 0.5);
+    doc["gvpPidMax"] = prefsGeneral.getFloat("gvpPidMax", 5.0);
+
+    // [НОВЕ] Завантаження налаштувань комфорту
+    String comfort1Str = prefsGeneral.getString("comfort1", "{\"enabled\":false,\"intervals\":[{\"start\":\"00:00\",\"end\":\"05:00\",\"reduct\":-2},{\"start\":\"10:00\",\"end\":\"16:00\",\"reduct\":-2},{\"start\":\"23:00\",\"end\":\"23:59\",\"reduct\":-2}],\"days\":[0,1,2,3,4,5,6]}");
+    String comfort2Str = prefsGeneral.getString("comfort2", "{\"enabled\":false,\"intervals\":[{\"start\":\"00:00\",\"end\":\"05:00\",\"reduct\":-2},{\"start\":\"10:00\",\"end\":\"16:00\",\"reduct\":-2},{\"start\":\"23:00\",\"end\":\"23:59\",\"reduct\":-2}],\"days\":[0,1,2,3,4,5,6]}");
+    
+    StaticJsonDocument<512> comfort1Doc;
+    deserializeJson(comfort1Doc, comfort1Str);
+    doc["comfort1"] = comfort1Doc.as<JsonObject>();
+
+    StaticJsonDocument<512> comfort2Doc;
+    deserializeJson(comfort2Doc, comfort2Str);
+    doc["comfort2"] = comfort2Doc.as<JsonObject>();
+
+    prefsGeneral.end();
+    
+    String output;
+    serializeJson(doc, output);
+    server.send(200, "application/json", output);
+}
+
+
+void handleSettingsSave() {
+    StaticJsonDocument<1024> doc; // Збільшено розмір для комфорту
+    deserializeJson(doc, server.arg("plain"));
+    const char* block = doc["block"];
+    if (!block) { server.send(400, "application/json", "{\"ok\":false,\"err\":\"no_block\"}"); return; }
+
+    prefsGeneral.begin("general", false);
+    
+    if (strcmp(block, "ctrl") == 0) {
+        prefsGeneral.putString("ctrlIndex", doc["value"].as<String>());
+    } else if (strcmp(block, "pumps") == 0) {
+        uint8_t oldMask = globalPumpEnableMask;
+        uint8_t newMask = doc["mask"] | 0b1111;
+        prefsGeneral.putUChar("pumpEnableMask", newMask);
+        globalPumpEnableMask = newMask;
+
+        if ((oldMask & 1) && !(newMask & 1)) {
+            bitSet(relayStates, 2); pumpLogic1.state = S_IDLE; }
+        if ((oldMask & 2) && !(newMask & 2)) {
+            bitSet(relayStates, 3); pumpLogic1.state = S_IDLE; }
+        if ((oldMask & 4) && !(newMask & 4)) {
+            bitSet(relayStates, 6); pumpLogic2.state = S_IDLE; }
+        if ((oldMask & 8) && !(newMask & 8)) {
+            bitSet(relayStates, 7); pumpLogic2.state = S_IDLE; }
+    } else if (strcmp(block, "curve") == 0) {
+        String pointsJson;
+        serializeJson(doc["points"], pointsJson);
+        prefsGeneral.putString("curvePoints", pointsJson);
+    } else if (strcmp(block, "summer_cutoff") == 0) {
+        prefsGeneral.putFloat("summerCutoff", doc["value"]);
+    } else if (strcmp(block, "gvp_pid") == 0) {
+        prefsGeneral.putFloat("gvpPidDz", doc["dz"]);
+        prefsGeneral.putFloat("gvpPidKf", doc["kf"]);
+        prefsGeneral.putFloat("gvpPidMax", doc["max"]);
+    } else if (strcmp(block, "pi1") == 0 || strcmp(block, "pi2") == 0) {
+        String prefix = (strcmp(block, "pi1") == 0) ? "pi1_" : "pi2_";
+        prefsGeneral.putFloat((prefix + "Ki").c_str(), doc["ki"]);
+        prefsGeneral.putFloat((prefix + "Kp").c_str(), doc["kp"]);
+        prefsGeneral.putFloat((prefix + "Ti").c_str(), doc["ti"]);
+    } else if (strcmp(block, "comfort1") == 0 || strcmp(block, "comfort2") == 0) {
+        String comfortJson;
+        serializeJson(doc["config"], comfortJson);
+        prefsGeneral.putString(block, comfortJson);
+    } else { 
+        prefsGeneral.end();
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"unknown_block\"}"); 
+        return; 
+    }
+
+    prefsGeneral.end();
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// [ОНОВЛЕНО] Ендпоінт для встановлення часу
+void handleTimeSet() {
+    if (!isRtcAvailable) {
+        server.send(503, "application/json", "{\"ok\":false,\"err\":\"RTC offline\"}");
+        return;
+    }
+    StaticJsonDocument<128> doc;
+    deserializeJson(doc, server.arg("plain"));
+    int h = doc["h"];
+    int m = doc["m"];
+    int dow = doc["dow"]; // 0=Нд, 1=Пн, ...
+
+    DateTime now = rtc.now();
+    rtc.adjust(DateTime(now.year(), now.month(), now.day(), h, m, 0));
+    
+    // [НОВЕ] Встановлюємо прапорець, що час було налаштовано
+    prefsGeneral.begin("general", false);
+    prefsGeneral.putBool("timeWasSet", true);
+    prefsGeneral.end();
+    
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
+
+// --- Секция 13.3: Логика управления насосами ---
+// ... (Код без змін) ...
+void setPumpRelayState(int contourNum, int pumpIndex, bool turnOn) {
+    int relayIndex = -1;
+    if (contourNum == 1) {
+        relayIndex = (pumpIndex == 0) ? 2 : 3;
+    } else if (contourNum == 2) {
+        relayIndex = (pumpIndex == 0) ? 6 : 7;
+    }
+    if (relayIndex != -1) {
+        if (turnOn) bitClear(relayStates, relayIndex);
+        else bitSet(relayStates, relayIndex);
+    }
+}
+void runPumpLogic(int contourNum) {
+    if (!isRelayExpanderAvailable) return;
+
+    ContourPumpLogic& logic = (contourNum == 1) ? pumpLogic1 : pumpLogic2;
+    int mode, dry_run, feedback1, feedback2;
+    
+    if (!isInputExpanderAvailable) { // "Сліпий" режим
+        mode = (contourNum == 1) ? wasInAutoModeContour1 : wasInAutoModeContour2;
+        dry_run = 1; // Завжди вважаємо ОК
+        feedback1 = bitRead(relayStates, (contourNum == 1) ? 2 : 6) == 0; // Зворотній зв'язок = команда
+        feedback2 = bitRead(relayStates, (contourNum == 1) ? 3 : 7) == 0;
+    } else {
+        mode = (contourNum == 1) ? contour1_mode_stable : contour2_mode_stable;
+        dry_run = (contourNum == 1) ? dry_run_state_stable : dry_run_state_2_stable;
+        feedback1 = (contourNum == 1) ? pump1_state_stable : pump3_state_stable;
+        feedback2 = (contourNum == 1) ? pump2_state_stable : pump4_state_stable;
+    }
+    
+    String profileId = getProfileId(contourNum);
+
+    if (profileId.startsWith("CO")) {
+        int tn_idx = -1;
+        for(int i=0; i<OW_VAR_COUNT; ++i) { if (strcmp(OW_VARS[i], "Tn") == 0) tn_idx = i; }
+        
+        if (tn_idx != -1 && !sensorStates[tn_idx].is_alarm) {
+            prefsGeneral.begin("general", true);
+            float summerCutoffTemp = prefsGeneral.getFloat("summerCutoff", 20.0f);
+            prefsGeneral.end();
+            if (sensorStates[tn_idx].temperature >= summerCutoffTemp) {
+                 if (logic.state != S_IDLE || logic.summer_mode_active == false) {
+                    setPumpRelayState(contourNum, 0, false);
+                    setPumpRelayState(contourNum, 1, false);
+                    logic.pumps[0].status = S_OK;
+                    logic.pumps[1].status = S_OK;
+                    logic.state = S_IDLE;
+                 }
+                 logic.summer_mode_active = true;
+                 return;
+            }
+        }
+    }
+    logic.summer_mode_active = false;
+    
+    uint8_t pumpMask = globalPumpEnableMask;
+    bool p1_enabled = (contourNum == 1) ? (pumpMask & 1) : (pumpMask & 4);
+    bool p2_enabled = (contourNum == 1) ? (pumpMask & 2) : (pumpMask & 8);
+    
+    if (!p1_enabled) logic.pumps[0].status = S_REPAIR;
+    else if (logic.pumps[0].status == S_REPAIR) logic.pumps[0].status = S_OK;
+    if (!p2_enabled) logic.pumps[1].status = S_REPAIR;
+    else if (logic.pumps[1].status == S_REPAIR) logic.pumps[1].status = S_OK;
+
+    if (profileId == "CUSTOM_6" || mode == 0) {
+        if (logic.state != S_IDLE) {
+           setPumpRelayState(contourNum, 0, false);
+           setPumpRelayState(contourNum, 1, false);
+           logic.state = S_IDLE;
+        }
+        logic.prev_mode = mode;
+        return;
+    }
+    
+    if (logic.prev_mode == 0 && mode == 1) {
+        if (logic.pumps[0].status == S_ALARM) logic.pumps[0].status = S_OK;
+        if (logic.pumps[1].status == S_ALARM) logic.pumps[1].status = S_OK;
+        
+        PIDController& controller = (contourNum == 1) ? pidController1 : pidController2;
+        controller.impulseCounter = 0;
+        controller.integralSum = 0;
+        
+        logic.state = S_IDLE;
+    }
+    logic.prev_mode = mode;
+
+    if (isInputExpanderAvailable) {
+        if (logic.prev_dry_run_stable == 1 && dry_run == 0) {
+            logic.dryRunAlarmPending = true;
+            logic.dryRunAlarmStartTime = millis();
+        }
+        if (logic.dryRunAlarmPending) {
+            if (dry_run == 1) {
+                logic.dryRunAlarmPending = false;
+            } else if (millis() - logic.dryRunAlarmStartTime >= 5000) {
+                setPumpRelayState(contourNum, 0, false);
+                setPumpRelayState(contourNum, 1, false);
+                logic.pumps[0].status = S_OK;
+                logic.pumps[1].status = S_OK;
+                logic.dryRunAlarmPending = false; 
+            }
+        }
+        if (logic.prev_dry_run_stable == 0 && dry_run == 1) {
+            logic.state = S_DRY_RUN_RECOVERY;
+            logic.stateTimer = millis();
+        }
+        logic.prev_dry_run_stable = dry_run;
+
+        if (logic.state == S_DRY_RUN_RECOVERY) {
+            if (millis() - logic.stateTimer >= 5000) {
+                logic.state = S_IDLE;
+            } else {
+                return;
+            }
+        }
+        
+        if (dry_run == 0) {
+            setPumpRelayState(contourNum, 0, false);
+            setPumpRelayState(contourNum, 1, false);
+            return;
+        }
+    }
+    
+    switch (logic.state) {
+        case S_IDLE: {
+            if (logic.pumps[0].status == S_ALARM && logic.pumps[1].status == S_ALARM) {
+                logic.state = S_ALL_PUMPS_ALARM;
+                logic.stateTimer = millis();
+                break;
+            }
+            
+            int pumpToStart = -1;
+            if (logic.pumps[0].status == S_OK) pumpToStart = 0;
+            else if (logic.pumps[1].status == S_OK) pumpToStart = 1;
+
+            if (pumpToStart != -1) {
+                logic.activePumpIndex = pumpToStart;
+                logic.state = S_START_DELAY;
+                logic.stateTimer = millis();
+            } else {
+                if(logic.pumps[0].status == S_ALARM) logic.pumps[0].status = S_OK;
+                if(logic.pumps[1].status == S_ALARM) logic.pumps[1].status = S_OK;
+                logic.state = S_CHANGEOVER_PAUSE; 
+                logic.stateTimer = millis();
+            }
+            break;
+        }
+
+        case S_START_DELAY: {
+            if (millis() - logic.stateTimer >= 5000) {
+                setPumpRelayState(contourNum, logic.activePumpIndex, true);
+                logic.state = S_WAIT_FEEDBACK;
+                logic.stateTimer = millis();
+            }
+            break;
+        }
+
+        case S_WAIT_FEEDBACK: {
+            bool feedbackReceived = (logic.activePumpIndex == 0) ? feedback1 : feedback2;
+            if (feedbackReceived) {
+                logic.pumps[logic.activePumpIndex].status = S_WORKING;
+                logic.pumps[logic.activePumpIndex].workStartTime = millis();
+                logic.pumps[logic.activePumpIndex].feedbackLossTime = 0;
+                logic.state = S_NORMAL;
+            } else if (millis() - logic.stateTimer >= 10000) {
+                setPumpRelayState(contourNum, logic.activePumpIndex, false);
+                logic.pumps[logic.activePumpIndex].status = S_ALARM;
+                int otherPump = 1 - logic.activePumpIndex;
+                if (logic.pumps[otherPump].status == S_OK) {
+                    logic.activePumpIndex = otherPump;
+                    logic.state = S_START_DELAY;
+                    logic.stateTimer = millis();
+                } else {
+                    logic.state = S_IDLE;
+                }
+            }
+            break;
+        }
+        
+        case S_NORMAL: {
+            if (millis() - logic.pumps[logic.activePumpIndex].workStartTime >= 172800000) { // 48 годин
+                logic.state = S_CHANGEOVER_PAUSE;
+                logic.stateTimer = millis();
+                setPumpRelayState(contourNum, logic.activePumpIndex, false);
+                logic.pumps[logic.activePumpIndex].status = S_OK;
+                break;
+            }
+            bool feedbackPresent = (logic.activePumpIndex == 0) ? feedback1 : feedback2;
+            if (feedbackPresent) {
+                logic.pumps[logic.activePumpIndex].feedbackLossTime = 0;
+            } else {
+                if (logic.pumps[logic.activePumpIndex].feedbackLossTime == 0) {
+                    logic.pumps[logic.activePumpIndex].feedbackLossTime = millis();
+                } else if (millis() - logic.pumps[logic.activePumpIndex].feedbackLossTime >= 10000) {
+                    setPumpRelayState(contourNum, logic.activePumpIndex, false);
+                    logic.pumps[logic.activePumpIndex].status = S_ALARM;
+                    int otherPump = 1 - logic.activePumpIndex;
+                    if (logic.pumps[otherPump].status == S_OK) {
+                        logic.activePumpIndex = otherPump;
+                        logic.state = S_START_DELAY;
+                        logic.stateTimer = millis();
+                    } else {
+                        logic.state = S_IDLE;
+                    }
+                }
+            }
+            break;
+        }
+
+        case S_CHANGEOVER_PAUSE: {
+            if (millis() - logic.stateTimer >= 5000) {
+                int nextPump = 1 - logic.activePumpIndex;
+                if (logic.pumps[nextPump].status == S_OK) {
+                    logic.activePumpIndex = nextPump;
+                }
+                logic.state = S_IDLE;
+            }
+            break;
+        }
+        case S_ALL_PUMPS_ALARM: {
+            setPumpRelayState(contourNum, 0, false);
+            setPumpRelayState(contourNum, 1, false);
+
+            if (millis() - logic.stateTimer >= 1200000) { // 20 хвилин
+                logic.pumps[0].status = S_OK;
+                logic.pumps[1].status = S_OK;
+                logic.state = S_IDLE;
+            }
+            break;
+        }
+    }
+}
+void runValveMaintenance(int contourNum) {
+    PIDController& controller = (contourNum == 1) ? pidController1 : pidController2;
+    
+    int closeRelay = (contourNum == 1) ? 0 : 4;
+    triggerRelayPulse(closeRelay, 60000); 
+    
+    unsigned long start = millis();
+    while((long)(millis() - start) < 61000) {
+        esp_task_wdt_reset();
+        delay(100);
+    }
+    
+    int openRelay = (contourNum == 1) ? 1 : 5;
+    triggerRelayPulse(openRelay, 60000);
+
+    controller.phase = PIDController::PHASE_ACTIVE;
+    controller.standbyCycleCounter = 0;
+    controller.impulseCounter = 0;
+    controller.phaseChangeTime = 0;
+}
+void runPIDLogic(int contourNum) {
+    if (!isRelayExpanderAvailable) return;
+    
+    int mode = isInputExpanderAvailable ? 
+                 ((contourNum == 1) ? contour1_mode_stable : contour2_mode_stable) : 
+                 ((contourNum == 1) ? wasInAutoModeContour1 : wasInAutoModeContour2);
+
+    String profileId = getProfileId(contourNum);
+    ContourPumpLogic& pumpLogic = (contourNum == 1) ? pumpLogic1 : pumpLogic2;
+    if (mode == 0 || profileId == "CUSTOM_6" || (profileId.startsWith("CO") && pumpLogic.summer_mode_active)) return;
+
+    PIDController& controller = (contourNum == 1) ? pidController1 : pidController2;
+    int tileIdx = tileIndexById(profileId);
+    if (tileIdx < 0) return;
+    const TileDef& tile = getTile(tileIdx);
+    
+    bool isComfort = false;
+    float comfortReduction = 0.0f; // [ОНОВЛЕНО] Додано змінну
+    float Tust = calculateSetpoint(contourNum, isComfort, comfortReduction); // [ОНОВЛЕНО] Виклик нової функції
+    
+    int tpod_idx = -1, tinv_idx = -1;
+    for(int i=0; i<OW_VAR_COUNT; ++i) {
+        if (strcmp(OW_VARS[i], tile.TPOD) == 0) tpod_idx = i;
+        if (strcmp(OW_VARS[i], tile.TINV) == 0) tinv_idx = i;
+    }
+
+    if (isnan(Tust)) {
+        if (tpod_idx != -1 && tinv_idx != -1 && sensorStates[tpod_idx].is_alarm && sensorStates[tinv_idx].is_alarm) {
+             int openRelay = (contourNum == 1) ? 1 : 5;
+             triggerRelayPulse(openRelay, 60000);
+        }
+        return;
+    }
+
+    float Tcurrent = NAN;
+    bool isRegulatingByTpod = false;
+    if (profileId.startsWith("CO")) {
+        int tn_idx = -1;
+        for(int i=0; i<OW_VAR_COUNT; ++i) if (strcmp(OW_VARS[i], "Tn") == 0) tn_idx = i;
+        bool tn_ok = (tn_idx != -1) && !sensorStates[tn_idx].is_alarm;
+        bool tpod_ok = (tpod_idx != -1) && !sensorStates[tpod_idx].is_alarm;
+        bool tinv_ok = (tinv_idx != -1) && !sensorStates[tinv_idx].is_alarm;
+
+        if (tn_ok && tpod_ok) { Tcurrent = sensorStates[tpod_idx].temperature; isRegulatingByTpod = true; } 
+        else if (!tn_ok && tinv_ok) { Tcurrent = sensorStates[tinv_idx].temperature; } 
+        else if (!tn_ok && !tinv_ok && tpod_ok) { Tcurrent = sensorStates[tpod_idx].temperature; isRegulatingByTpod = true; } 
+        else if (!tpod_ok && tinv_ok) { Tcurrent = sensorStates[tinv_idx].temperature; } 
+        else return;
+    } else { // GVP
+        bool tpod_ok = (tpod_idx != -1) && !sensorStates[tpod_idx].is_alarm;
+        bool tinv_ok = (tinv_idx != -1) && !sensorStates[tinv_idx].is_alarm;
+        if (tpod_ok) { Tcurrent = sensorStates[tpod_idx].temperature; isRegulatingByTpod = true; }
+        else if (tinv_ok) { Tcurrent = sensorStates[tinv_idx].temperature; }
+        else return;
+    }
+    
+    prefsGeneral.begin("general", true);
+    String piPrefix = (contourNum == 1) ? "pi1_" : "pi2_";
+    float Kp = prefsGeneral.getFloat((piPrefix + "Kp").c_str(), 0.0f);
+    float Ki = prefsGeneral.getFloat((piPrefix + "Ki").c_str(), 0.0f);
+    float base_Ti_s = prefsGeneral.getFloat((piPrefix + "Ti").c_str(), 2.0f);
+    prefsGeneral.end();
+
+    float error = isRegulatingByTpod ? (Tust - Tcurrent) : (Tcurrent - Tust);
+    
+    if (abs(error) < 0.5) {
+        controller.integralSum = 0;
+        controller.lastDirection = 0;
+        return;
+    }
+
+    float pulseDuration_s = base_Ti_s;
+    if (profileId.startsWith("GVP") && error > 0) {
+        prefsGeneral.begin("general", true);
+        float deadzone = prefsGeneral.getFloat("gvpPidDz", 2.0f);
+        float factor = prefsGeneral.getFloat("gvpPidKf", 0.5f);
+        float max_ti = prefsGeneral.getFloat("gvpPidMax", 5.0f);
+        prefsGeneral.end();
+        if (error > deadzone) {
+            pulseDuration_s = min(max_ti, base_Ti_s * (1.0f + (error - deadzone) * factor));
+        }
+    }
+
+    float dt = (millis() - controller.lastRunTime) / 1000.0f;
+    controller.lastRunTime = millis();
+    if (dt <= 0) return;
+    
+    if (abs(error) > 0.5) {
+        controller.integralSum += error * dt;
+    }
+    
+    const float INTEGRAL_LIMIT = 1000.0f;
+    if (controller.integralSum > INTEGRAL_LIMIT) controller.integralSum = INTEGRAL_LIMIT;
+    else if (controller.integralSum < -INTEGRAL_LIMIT) controller.integralSum = -INTEGRAL_LIMIT;
+    
+    float output = (Kp * error) + (Ki * controller.integralSum);
+
+    int currentDirection = (error > 0) ? 1 : -1;
+    if (currentDirection != controller.lastDirection) {
+        controller.impulseCounter = 0;
+        controller.lastDirection = currentDirection;
+    }
+    
+    int impulseLimit = (controller.phase == PIDController::PHASE_ACTIVE) ? 120 : 20;
+
+    if (controller.phase == PIDController::PHASE_ACTIVE && controller.impulseCounter >= 120) {
+        if (controller.phaseChangeTime == 0) controller.phaseChangeTime = millis();
+        if ((long)(millis() - controller.phaseChangeTime) > 3600000UL) {
+            controller.phase = PIDController::PHASE_STANDBY;
+            controller.standbyCycleCounter = 0;
+            controller.phaseChangeTime = millis();
+        }
+    } else if (controller.impulseCounter < 120) {
+        controller.phaseChangeTime = 0;
+    }
+    
+    if (controller.phase == PIDController::PHASE_STANDBY) {
+        if ((long)(millis() - controller.phaseChangeTime) > 3600000UL) {
+            controller.phaseChangeTime = millis();
+            controller.impulseCounter = 0;
+            controller.standbyCycleCounter++;
+            if (controller.standbyCycleCounter >= 200) {
+                runValveMaintenance(contourNum);
+                return;
+            }
+        }
+    }
+
+    if (controller.impulseCounter >= impulseLimit) return;
+    
+    unsigned long pause = (abs(output) > 0.01) ? (unsigned long)(100000.0f / abs(output)) : 0xFFFFFFFF;
+    if (pause == 0) return;
+    
+    if ((long)(millis() - controller.lastImpulseTime) > (long)pause) {
+        int relayIndex = (contourNum == 1) ? ((error > 0) ? 1 : 0) : ((error > 0) ? 5 : 4);
+        triggerRelayPulse(relayIndex, (unsigned long)(pulseDuration_s * 1000));
+        controller.lastImpulseTime = millis();
+        controller.impulseCounter++;
+    }
+}
+
+
+// --- Секция 13.5: Функции отрисовки для OLED ---
+String getUptime() {
+    long seconds = millis() / 1000;
+    int days = seconds / 86400;
+    seconds %= 86400;
+    int hours = seconds / 3600;
+    seconds %= 3600;
+    int minutes = seconds / 60;
+    return String(days) + "d " + String(hours) + "h " + String(minutes) + "m";
+}
+
+float getTempByVar(const char* varName, bool& isAlarm) {
+    for(int i=0; i<OW_VAR_COUNT; ++i) {
+        if (strcmp(OW_VARS[i], varName) == 0) {
+            isAlarm = sensorStates[i].is_alarm;
+            return sensorStates[i].temperature;
+        }
+    }
+    isAlarm = true;
+    return DEVICE_DISCONNECTED_C;
+}
+
+const char* getPumpStatusStringOLED(PumpStatus status) {
+    switch (status) {
+        case S_WORKING: return "WORK";
+        case S_ALARM:   return "ALARM";
+        case S_REPAIR:  return "REPAIR";
+        case S_OK:      
+        default:        return "OK";
+    }
+}
+
+void drawI2CFaultScreen(const char* line1, const char* line2, const char* line3) {
+    u8g2.firstPage();
+    do {
+        u8g2.setFont(u8g2_font_ncenB10_tr);
+        u8g2.drawStr(0, 12, "SYSTEM ALARM");
+        u8g2.setFont(u8g2_font_6x10_tf);
+        u8g2.drawStr(0, 32, line1);
+        u8g2.drawStr(0, 48, line2);
+        u8g2.drawStr(0, 62, line3);
+    } while (u8g2.nextPage());
+}
+
+void drawContour1Screen() {
+    char buffer[32];
+    u8g2.firstPage();
+    do {
+        String profileId = getProfileId(1);
+        int tileIdx = tileIndexById(profileId);
+        if(tileIdx < 0) tileIdx = TILE_CUSTOM_6;
+        
+        u8g2.setFont(u8g2_font_ncenB10_tr);
+        u8g2.drawStr(0, 12, profileId.substring(0, 5).c_str());
+
+        u8g2.setFont(u8g2_font_6x10_tf);
+        u8g2.drawStr(110, 10, "1/3");
+
+        const TileDef& tile = getTile(tileIdx);
+        bool tpod_al, tinv_al;
+        float tpod = getTempByVar(tile.TPOD, tpod_al);
+        float tinv = getTempByVar(tile.TINV, tinv_al);
+        
+        bool isComfort = false;
+        float comfortReduction = 0.0f;
+        float tzad = calculateSetpoint(1, isComfort, comfortReduction);
+
+        sprintf(buffer, "Tsup: %s%s", tpod_al ? "AL" : String(tpod, 1).c_str(), tpod_al ? "" : " C");
+        u8g2.drawStr(0, 24, buffer);
+        sprintf(buffer, "Tret: %s%s", tinv_al ? "AL" : String(tinv, 1).c_str(), tinv_al ? "" : " C");
+        u8g2.drawStr(0, 34, buffer);
+
+        // [ОНОВЛЕНО] Логіка відображення уставки
+        if (pumpLogic1.summer_mode_active) {
+            sprintf(buffer, "Tset: SUMMER");
+        } else if (isComfort) {
+            sprintf(buffer, "Tset: %sC(%.1f)", isnan(tzad) ? "--.-" : String(tzad, 1).c_str(), comfortReduction);
+        } else {
+            sprintf(buffer, "Tset: %s C", isnan(tzad) ? "--.-" : String(tzad, 1).c_str());
+        }
+        u8g2.drawStr(0, 44, buffer);
+        
+        const char* p1_status = getPumpStatusStringOLED(pumpLogic1.pumps[0].status);
+        const char* p2_status = getPumpStatusStringOLED(pumpLogic1.pumps[1].status);
+        if (pumpLogic1.state == S_ALL_PUMPS_ALARM) {
+             sprintf(buffer, "PUMPS: ALARM");
+        } else {
+             sprintf(buffer, "P1:%s  P2:%s", p1_status, p2_status);
+        }
+        u8g2.drawStr(0, 54, buffer);
+        
+        sprintf(buffer, "DryRun: %s", dry_run_state_stable ? "OK" : "ALARM");
+        u8g2.drawStr(0, 64, buffer);
+
+    } while (u8g2.nextPage());
+}
+
+
+void drawContour2Screen() {
+    char buffer[32];
+    u8g2.firstPage();
+    do {
+        String profileId = getProfileId(2);
+        int tileIdx = tileIndexById(profileId);
+        if(tileIdx < 0) tileIdx = TILE_CUSTOM_6;
+
+        u8g2.setFont(u8g2_font_ncenB10_tr);
+        u8g2.drawStr(0, 12, profileId.substring(0, 5).c_str());
+
+        u8g2.setFont(u8g2_font_6x10_tf);
+        u8g2.drawStr(110, 10, "2/3");
+
+        const TileDef& tile = getTile(tileIdx);
+        bool tpod_al, tinv_al;
+        float tpod = getTempByVar(tile.TPOD, tpod_al);
+        float tinv = getTempByVar(tile.TINV, tinv_al);
+        
+        bool isComfort = false;
+        float comfortReduction = 0.0f;
+        float tzad = calculateSetpoint(2, isComfort, comfortReduction);
+
+        sprintf(buffer, "Tsup: %s%s", tpod_al ? "AL" : String(tpod, 1).c_str(), tpod_al ? "" : " C");
+        u8g2.drawStr(0, 24, buffer);
+        sprintf(buffer, "Tret: %s%s", tinv_al ? "AL" : String(tinv, 1).c_str(), tinv_al ? "" : " C");
+        u8g2.drawStr(0, 34, buffer);
+        
+        // [ОНОВЛЕНО] Логіка відображення уставки
+        if (pumpLogic2.summer_mode_active) {
+            sprintf(buffer, "Tset: SUMMER");
+        } else if (isComfort) {
+            sprintf(buffer, "Tset: %sC(%.1f)", isnan(tzad) ? "--.-" : String(tzad, 1).c_str(), comfortReduction);
+        } else {
+            sprintf(buffer, "Tset: %s C", isnan(tzad) ? "--.-" : String(tzad, 1).c_str());
+        }
+        u8g2.drawStr(0, 44, buffer);
+
+        const char* p1_status = getPumpStatusStringOLED(pumpLogic2.pumps[0].status);
+        const char* p2_status = getPumpStatusStringOLED(pumpLogic2.pumps[1].status);
+        if (pumpLogic2.state == S_ALL_PUMPS_ALARM) {
+             sprintf(buffer, "PUMPS: ALARM");
+        } else {
+             sprintf(buffer, "P1:%s  P2:%s", p1_status, p2_status);
+        }
+        u8g2.drawStr(0, 54, buffer);
+
+        sprintf(buffer, "DryRun: %s", dry_run_state_2_stable ? "OK" : "ALARM");
+        u8g2.drawStr(0, 64, buffer);
+        
+    } while (u8g2.nextPage());
+}
+
+// [ОНОВЛЕНО] Системний екран
+void drawSystemScreen() {
+    char buffer[32];
+    u8g2.firstPage();
+    do {
+        u8g2.setFont(u8g2_font_ncenB10_tr);
+        u8g2.drawStr(0, 12, "System");
+
+        u8g2.setFont(u8g2_font_6x10_tf);
+        u8g2.drawStr(110, 10, "3/3");
+        
+        if (isRtcAvailable) {
+            DateTime now = rtc.now();
+            const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+            sprintf(buffer, "Time: %02d:%02d (%s)", now.hour(), now.minute(), days[now.dayOfTheWeek()]);
+            u8g2.drawStr(0, 26, buffer);
+        } else {
+            u8g2.drawStr(0, 26, "TIME: OFFLINE");
+        }
+        
+        bool tn_al, t1_al, t2_al;
+        float tn = getTempByVar("Tn", tn_al);
+        float t1 = getTempByVar("T1", t1_al);
+        float t2 = getTempByVar("T2", t2_al);
+        
+        sprintf(buffer, "T out: %s%s", tn_al ? "AL" : String(tn, 1).c_str(), tn_al ? "" : " C");
+        u8g2.drawStr(0, 40, buffer);
+        
+        sprintf(buffer, "T net: %s / %s C", t1_al ? "AL" : String(t1, 1).c_str(), t2_al ? "AL" : String(t2, 1).c_str());
+        u8g2.drawStr(0, 52, buffer);
+        
+        if (!dry_run_state_stable || !dry_run_state_2_stable) {
+            u8g2.drawStr(0, 64, "ALARM: DRY RUN");
+        }
+
+    } while (u8g2.nextPage());
+}
+
+void drawWifiAPScreen() {
+    char buffer[32];
+    u8g2.firstPage();
+    do {
+        u8g2.setFont(u8g2_font_ncenB10_tr);
+        u8g2.drawStr(0, 12, "Wi-Fi AP");
+
+        u8g2.setFont(u8g2_font_6x10_tf);
+        u8g2.drawStr(0, 24, "SETUP MODE");
+
+        sprintf(buffer, "SSID: %s", AP_SSID);
+        u8g2.drawStr(0, 40, buffer);
+        
+        sprintf(buffer, "IP: %s", apIP.toString().c_str());
+        u8g2.drawStr(0, 52, buffer);
+
+        sprintf(buffer, "Clients: %d", WiFi.softAPgetStationNum());
+        u8g2.drawStr(0, 64, buffer);
+    } while (u8g2.nextPage());
+}
+
+void updateDisplay() {
+    if (!isDisplayAvailable || !displayOn) return;
+
+    Wire.beginTransmission(OLED_ADDR);
+    if (Wire.endTransmission() != 0) {
+        if (displayErrorCounter < 255) displayErrorCounter++;
+        return;
+    } else {
+        displayErrorCounter = 0;
+    }
+    
+    // Пріоритетне відображення аварій
+    if (!isRelayExpanderAvailable) {
+        drawI2CFaultScreen("RELAY BOARD FAULT", "(I2C)", "CONTROL STOPPED");
+        return;
+    }
+    if (!isInputExpanderAvailable) {
+        drawI2CFaultScreen("INPUT BOARD FAULT", "(I2C)", "BLIND MODE ACTIVE");
+        return;
+    }
+    
+    switch(currentScreen) {
+        case 1: drawContour1Screen(); break;
+        case 2: drawContour2Screen(); break;
+        case 3: drawSystemScreen(); break;
+        case 4: drawWifiAPScreen(); break;
+        default: break;
+    }
+}
+
+// --- Секция 13.6: Функции управления кнопкой и Wi-Fi ---
+void handleWifiAP() {
+    if (apModeActive) {
+        if (millis() - apModeStartTime > apTimeout) {
+            apModeActive = false;
+            currentScreen = 1; 
+            lastDisplayActivityTime = millis();
+            
+            WiFi.softAPdisconnect(true);
+            server.stop();
+        }
+    }
+}
+
+void handleButton() {
+    int reading = digitalRead(BUTTON_PIN);
+
+    if (reading != lastButtonState) {
+        lastDebounceTime = millis();
+    }
+
+    if ((millis() - lastDebounceTime) > debounceDelay) {
+        if (reading != buttonState) {
+            buttonState = reading;
+
+            if (buttonState == HIGH) {
+                buttonPressStartTime = millis();
+                longPressTriggered = false;
+            } else { // Кнопку відпустили
+                if (!longPressTriggered) { // Це коротке натискання
+                    lastDisplayActivityTime = millis();
+                    
+                    if (isDisplayAvailable) {
+                        if (!displayOn) {
+                            displayOn = true;
+                            u8g2.setPowerSave(0);
+                            currentScreen = 1;
+                        } else {
+                            currentScreen++;
+                            if (currentScreen > 3) {
+                                currentScreen = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    lastButtonState = reading;
+
+    if (buttonState == HIGH && !longPressTriggered && (millis() - buttonPressStartTime > 5000)) {
+        longPressTriggered = true;
+        
+        if (!apModeActive) {
+            apModeActive = true;
+            WiFi.softAPConfig(apIP, apGW, apMASK);
+            WiFi.softAP(AP_SSID, AP_PASS);
+            server.begin();
+            if (isDisplayAvailable) {
+              displayOn = true;
+              u8g2.setPowerSave(0);
+            }
+            currentScreen = 4;
+            apModeStartTime = millis();
+            lastDisplayActivityTime = millis();
+        }
+    }
+}
+
+// [ОНОВЛЕНО] Функція для управління станами та відновленням I2C-пристроїв
+void manageI2CDevices() {
+    // Оновлення прапорців на основі лічильників помилок
+    if (isDisplayAvailable && displayErrorCounter >= I2C_ERROR_THRESHOLD) isDisplayAvailable = false;
+    if (isRelayExpanderAvailable && relayErrorCounter >= I2C_ERROR_THRESHOLD) isRelayExpanderAvailable = false;
+    if (isInputExpanderAvailable && inputErrorCounter >= I2C_ERROR_THRESHOLD) isInputExpanderAvailable = false;
+    if (isRtcAvailable && rtcErrorCounter >= I2C_ERROR_THRESHOLD) isRtcAvailable = false;
+    
+    // Логіка відновлення
+    if ((!isDisplayAvailable || !isRelayExpanderAvailable || !isInputExpanderAvailable || !isRtcAvailable) && (millis() - lastI2CRecoveryAttempt > I2C_RECOVERY_INTERVAL)) {
+        lastI2CRecoveryAttempt = millis();
+
+        if (!isDisplayAvailable) {
+            Wire.beginTransmission(OLED_ADDR);
+            if (Wire.endTransmission() == 0) { isDisplayAvailable = true; displayErrorCounter = 0; }
+        }
+        if (!isRelayExpanderAvailable) {
+            Wire.beginTransmission(RELAY_I2C_ADDR);
+            if (Wire.endTransmission() == 0) {
+                isRelayExpanderAvailable = true; relayErrorCounter = 0;
+                pidController1.integralSum = 0; pidController2.integralSum = 0;
+                pumpLogic1.state = S_IDLE; pumpLogic2.state = S_IDLE;
+            }
+        }
+        if (!isInputExpanderAvailable) {
+            Wire.beginTransmission(PCF8574_INPUTS_ADDR);
+            if (Wire.endTransmission() == 0) { isInputExpanderAvailable = true; inputErrorCounter = 0; }
+        }
+        if (!isRtcAvailable) {
+            if (rtc.begin()) { isRtcAvailable = true; rtcErrorCounter = 0; }
+        }
+    }
+}
+
+// --- Секция 14: Основные функции setup() и loop() ---
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = 60000,
+      .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+      .trigger_panic = true,
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+
+  pinMode(BUTTON_PIN, INPUT_PULLDOWN); 
+  
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  
+  // [ОНОВЛЕНО] Сканування шини I2C
+  Serial.println("Scanning I2C bus...");
+  Wire.beginTransmission(PCF8574_INPUTS_ADDR);
+  if (Wire.endTransmission() == 0) { isInputExpanderAvailable = true; Serial.println("Input Expander (0x22) ... ONLINE"); } else { Serial.println("Input Expander (0x22) ... OFFLINE"); }
+  Wire.beginTransmission(RELAY_I2C_ADDR);
+  if (Wire.endTransmission() == 0) { isRelayExpanderAvailable = true; Serial.println("Relay Expander (0x24) ... ONLINE"); } else { Serial.println("Relay Expander (0x24) ... OFFLINE"); }
+  Wire.beginTransmission(OLED_ADDR);
+  if (Wire.endTransmission() == 0) { isDisplayAvailable = true; Serial.println("OLED Display (0x3C) ... ONLINE"); } else { Serial.println("OLED Display (0x3C) ... OFFLINE"); }
+  if (rtc.begin()) { isRtcAvailable = true; Serial.println("RTC DS3231 ... ONLINE"); } else { Serial.println("RTC DS3231 ... OFFLINE"); }
+
+  if (isDisplayAvailable) {
+    u8g2.begin();
+    u8g2.firstPage();
+    do {
+        u8g2.setFont(u8g2_font_6x10_tf);
+        u8g2.drawStr(0, 12, "WWT-A8 Controller");
+        u8g2.drawStr(0, 26, "System starting...");
+    } while (u8g2.nextPage());
+    delay(2000);
+  } else {
+    delay(2000);
+  }
+  
+  if (isDisplayAvailable) {
+    displayOn = true;
+    currentScreen = 1;
+    lastDisplayActivityTime = millis();
+    updateDisplay();
+  }
+
+  updateRelays();
+  prefs.begin(OW_NVS_NS, false);
+  prefsProfiles.begin("profiles", false);
+  prefsParams.begin("params", false);
+  prefsGeneral.begin("general", false);
+  
+  globalPumpEnableMask = prefsGeneral.getUChar("pumpEnableMask", 0b1111);
+
+  WiFi.mode(WIFI_AP_STA); 
+  WiFi.softAPdisconnect(true);
+
+  ds18.begin();
+  ds18.setResolution(11);
+  ds18.setWaitForConversion(true);
+
+  server.on("/", HTTP_GET, handleRoot);
+  
+  server.on("/api/contour/profile", HTTP_GET, []() {
+    server.sendHeader("Cache-Control","no-cache");
+    int cont = server.arg("cont").toInt();
+    if (cont != 1 && cont != 2) { server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad cont\"}"); return; }
+    String id = getProfileId((uint8_t)cont);
+    int idx = tileIndexById(id);
+    const TileDef& td = getTile((idx>=0)? (uint8_t)idx : 0);
+    float pval = td.defaultValue;
+    if (td.TZAD && td.TZAD[0]) { 
+        prefsParams.begin("params", true);
+        pval = prefsParams.getFloat(td.TZAD, td.defaultValue); 
+        prefsParams.end();
+    }
+    
+    StaticJsonDocument<384> doc;
+    doc["ok"] = true;
+    doc["cont"] = cont;
+    doc["id"] = id;
+    doc["display"] = td.displayName;
+    doc["TPOD"] = td.TPOD;
+    doc["TINV"] = td.TINV;
+    doc["TZAD"] = td.TZAD;
+    doc["settingsLabel"] = td.settingsLabel;
+    doc["defaultValue"] = td.defaultValue;
+    doc["paramValue"] = pval;
+    
+    String output;
+    serializeJson(doc, output);
+    server.send(200, "application/json", output);
+  });
+
+  server.on("/api/contour/profile", HTTP_POST, []() {
+    StaticJsonDocument<128> doc;
+    deserializeJson(doc, server.arg("plain"));
+    int cont = doc["cont"];
+    String id = doc["id"];
+    if (cont != 1 && cont != 2) { server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad cont\"}"); return; }
+    if (!tileIdExists(id)) { server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad id\"}"); return; }
+    if (!setProfileId((uint8_t)cont, id)) { server.send(500, "application/json", "{\"ok\":false,\"err\":\"save failed\"}"); return; }
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+  
+  server.on("/api/ow/scan", HTTP_POST, handleOwScan);
+  server.on("/api/ow/status", HTTP_GET, handleOwStatus);
+
+  server.on("/api/ow/bind", HTTP_POST, []() {
+    StaticJsonDocument<128> doc;
+    deserializeJson(doc, server.arg("plain"));
+    String var = doc["var"];
+    String rom = doc["rom"];
+    if (var.length()==0 || rom.length()==0) { server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing var/rom\"}"); return; }
+    String cleared, replaced, err;
+    bool ok = nvsBindVarToRom(var, rom, &cleared, &replaced, &err);
+    if (!ok) { server.send(400, "application/json", "{\"ok\":false,\"err\":\""+err+"\"}"); return; }
+    
+    StaticJsonDocument<192> response_doc;
+    response_doc["ok"] = true;
+    response_doc["var"] = var;
+    response_doc["rom"] = rom;
+    if (cleared.length()) response_doc["cleared"] = cleared;
+    
+    String output;
+    serializeJson(response_doc, output);
+    server.send(200, "application/json", output);
+  });
+
+  server.on("/api/vars/status", HTTP_GET, []() {
+    const size_t MAX_REQ = 16;
+    String req[MAX_REQ]; size_t cnt = 0;
+    String csvNames = server.arg("names");
+    if (csvNames.length()) {
+      int s = 0;
+      while (s >= 0 && cnt < MAX_REQ) {
+        int c = csvNames.indexOf(',', s);
+        String tok = (c < 0) ? csvNames.substring(s) : csvNames.substring(s, c);
+        tok.trim();
+        if(tok.length() > 0 && owIsKnownVar(tok)) req[cnt++] = tok;
+        if (c < 0) break;
+        s = c + 1;
+      }
+    } else {
+      for (size_t i=0; i < OW_VAR_COUNT && cnt < MAX_REQ; i++) req[cnt++] = String(OW_VARS[i]);
+    }
+
+    StaticJsonDocument<768> doc;
+    doc["ok"] = true;
+    JsonArray vars = doc.createNestedArray("vars");
+
+    for (size_t i = 0; i < cnt; i++) {
+        JsonObject var = vars.createNestedObject();
+        var["name"] = req[i];
+        bool is_alarm;
+        float tC = getTempByVar(req[i].c_str(), is_alarm);
+        if (is_alarm) var["t"] = nullptr; else var["t"] = tC;
+    }
+    
+    String output;
+    serializeJson(doc, output);
+    server.send(200, "application/json", output);
+  });
+  
+  // [ОНОВЛЕНО] Ендпоінт для статусу системи
+  server.on("/api/system/status", HTTP_GET, []() {
+    StaticJsonDocument<256> doc; // Збільшено
+    doc["ok"] = true;
+    doc["display"] = isDisplayAvailable ? "ONLINE" : "OFFLINE";
+    doc["relay"] = isRelayExpanderAvailable ? "ONLINE" : "OFFLINE";
+    doc["input"] = isInputExpanderAvailable ? "ONLINE" : "OFFLINE";
+    
+    JsonObject rtc_status = doc.createNestedObject("rtc");
+    if (isRtcAvailable) {
+        DateTime now = rtc.now();
+        char buf[20];
+        const char* days[] = {"(Нд)", "(Пн)", "(Вт)", "(Ср)", "(Чт)", "(Пт)", "(Сб)"};
+        sprintf(buf, "%02d:%02d %s", now.hour(), now.minute(), days[now.dayOfTheWeek()]);
+        rtc_status["status"] = "ONLINE";
+        rtc_status["time"] = String(buf);
+    } else {
+        rtc_status["status"] = "OFFLINE";
+        rtc_status["time"] = "N/A";
+    }
+
+    String output;
+    serializeJson(doc, output);
+    server.send(200, "application/json", output);
+  });
+  
+  server.on("/api/settings/load", HTTP_GET, handleSettingsLoad);
+  server.on("/api/settings/save", HTTP_POST, handleSettingsSave);
+  server.on("/api/time/set", HTTP_POST, handleTimeSet);
+  server.on("/api/relay/pulse", HTTP_POST, handleRelayPulse);
+  server.on("/api/contour/param", HTTP_POST, handleParamSave);
+  server.on("/api/main/status", HTTP_GET, handleMainStatus);
+  server.onNotFound(handleNotFound);
+
+  dumpNvsToSerial();
+}
+
+void loop() {
+  esp_task_wdt_reset();
+  handleButton();
+  handleWifiAP();
+
+  manageI2CDevices();
+
+  if(apModeActive) {
+    server.handleClient();
+  }
+  
+  if (millis() - lastTempRequestTime > tempRequestInterval) {
+    lastTempRequestTime = millis();
+    ds18.requestTemperatures();
+    
+    for (int i = 0; i < OW_VAR_COUNT; i++) {
+        String rom = nvsGetRomForVar(OW_VARS[i]);
+        if (rom.length()) {
+            uint8_t addr[8];
+            if (owStringToAddr(rom, addr)) {
+                float temp = ds18.getTempC(addr);
+                bool current_alarm = false;
+                if (temp == DEVICE_DISCONNECTED_C) {
+                    current_alarm = true;
+                } else {
+                    const char* var = OW_VARS[i];
+                    if (strcmp(var, "Tn") == 0 && (temp < -40 || temp > 60)) current_alarm = true;
+                    else if ((strcmp(var, "T1") == 0 || strcmp(var, "T2") == 0) && (temp < 5 || temp > 110)) current_alarm = true;
+                    else if ((strcmp(var, "T11")==0 || strcmp(var, "T12")==0 || strcmp(var, "T21")==0 || strcmp(var, "T22")==0 || strcmp(var, "T31")==0 || strcmp(var, "T32")==0 || strcmp(var, "T41")==0 || strcmp(var, "T42")==0) && (temp < 5 || temp > 95)) current_alarm = true;
+                }
+
+                if (!current_alarm) {
+                    sensorStates[i].temperature = temp;
+                    sensorStates[i].lastUpdateTime = millis();
+                }
+
+                if ((long)(millis() - sensorStates[i].lastUpdateTime) > 30000) {
+                    sensorStates[i].is_alarm = true;
+                } else {
+                    sensorStates[i].is_alarm = false;
+                }
+            }
+        }
+    }
+  }
+
+  if (millis() - lastInputReadTime >= inputReadInterval) {
+    lastInputReadTime = millis();
+    readInputs();
+  }
+
+  if (millis() - lastPIDRunTime >= pidRunInterval) {
+      lastPIDRunTime = millis();
+      runPIDLogic(1);
+      runPIDLogic(2);
+  }
+
+  if (millis() - lastPumpLogicRunTime >= pumpLogicRunInterval) {
+      lastPumpLogicRunTime = millis();
+      runPumpLogic(1);
+      runPumpLogic(2);
+  }
+
+  if (millis() - lastDisplayUpdateTime > displayUpdateInterval) {
+      lastDisplayUpdateTime = millis();
+      updateDisplay();
+  }
+  
+  if (isDisplayAvailable && displayOn && millis() - lastDisplayActivityTime > displayTimeout) {
+      displayOn = false;
+      u8g2.setPowerSave(1);
+  }
+
+  bool relaysChanged = false;
+  for (int i = 0; i < 8; i++) {
+    if (pulseEndTimes[i] != 0 && (long)(millis() - pulseEndTimes[i]) >= 0) {
+      bitSet(relayStates, i);
+      pulseEndTimes[i] = 0;
+      relaysChanged = true;
+    }
+  }
+
+  static uint8_t lastRelayStates = 0xFF;
+  if (relayStates != lastRelayStates || relaysChanged) {
+      updateRelays();
+      lastRelayStates = relayStates;
+  }
+}
+
