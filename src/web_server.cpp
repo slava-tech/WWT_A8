@@ -1,16 +1,7 @@
 // =================================================================================
 
-#include "sensors.h" 
-#include "hardware.h" 
 #include "web_server.h"
 #include "utils.h"
-
-// --- Секция 12: HTML, CSS, JavaScript для веб-интерфейса ---
-// Здесь находится полный код вашей оригинальной веб-страницы.
-const char index_html[] PROGMEM = R"====(
-// ... HTML код ...
-)====";
-
 
 // --- Вспомогательные функции (реализация тех, что объявлены в utils.h) ---
 
@@ -43,26 +34,9 @@ String getProfileId(uint8_t cont) {
   return id;
 }
 
-
-// --- Обработчики HTTP-запросов ---
-
-void handleRoot() {
-  server.send_P(200, "text/html", index_html);
-}
-
-void handleNotFound(){
-  server.send(404, "text/plain", "Not found");
-}
-
-// ... (остальные обработчики handleOwScan, handleOwStatus и т.д.)
-
-
 // --- Функция настройки сервера ---
 
 void setupWebServer() {
-    server.on("/", handleRoot);
-    // ... (все остальные server.on(...))
-    server.onNotFound(handleNotFound);
     server.begin();
 }
 

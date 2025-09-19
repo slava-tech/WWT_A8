@@ -10,6 +10,7 @@
 #include "pid_control.h"
 #include "pump_control.h"
 #include "web_server.h"
+#include "web_interface.h"
 #include <esp_task_wdt.h>
 
 // --- Переменные для таймеров основного цикла ---

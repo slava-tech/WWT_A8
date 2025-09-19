@@ -4,15 +4,11 @@
 //               Управление реле, чтение входов, работа с дисплеем и RTC.
 // =================================================================================
 
+#include "config.h"
 #include "hardware.h"
-#include "sensors.h"
-#include "pid_control.h"
-#include "web_server.h"
-#include "pump_control.h"
-#include "utils.h"
+#include "definitions.h"
 
-
-// Вспомогательные переменные, нужные только этому файлу
+// --- Глобальные переменные ---
 uint8_t displayErrorCounter = 0;
 uint8_t relayErrorCounter = 0;
 uint8_t inputErrorCounter = 0;
@@ -21,8 +17,6 @@ const uint8_t I2C_ERROR_THRESHOLD = 5;
 
 unsigned long lastI2CRecoveryAttempt = 0;
 const unsigned long I2C_RECOVERY_INTERVAL = 15000; // 15 секунд
-
-unsigned long apModeStartTime = 0;
 
 // Для кнопки
 int buttonState = LOW;
@@ -39,6 +33,16 @@ void drawContour2Screen();
 void drawSystemScreen();
 void drawWifiAPScreen();
 
+// --- Функции ---
+
+void setRelay(int relayIndex, bool on) {
+    if (on) {
+        bitClear(relayStates, relayIndex);
+    } else {
+        bitSet(relayStates, relayIndex);
+    }
+    updateRelays();
+}
 
 void initializeHardware() {
     pinMode(BUTTON_PIN, INPUT_PULLDOWN);

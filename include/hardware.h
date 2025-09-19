@@ -16,7 +16,7 @@ void checkRelayPulses();
 void updateDisplay();
 void updateRelays();
 void triggerRelayPulse(int relayIndex, unsigned long duration);
-void setRelay(int relayNum, bool state);
+void setRelay(int relayIndex, bool on);
 
 
 #endif // HARDWARE_H
